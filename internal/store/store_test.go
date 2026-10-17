@@ -2,9 +2,13 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/soroworks/soroforge/internal/store"
 	"github.com/stretchr/testify/assert"
@@ -282,6 +286,28 @@ func TestMemoryStoreHistoryOrdersByIDWhenTimestampsTie(t *testing.T) {
 		[]string{history[0].WasmHash, history[1].WasmHash, history[2].WasmHash})
 }
 
+func TestSQLiteStore(t *testing.T) {
+	runStoreSuite(t, func(t *testing.T) store.Store {
+		// SQLite is pure Go and needs no database; this is the conformance proof
+		// that the new store is substitutable for MemoryStore and Postgres.
+		tmpDir := t.TempDir()
+		path := filepath.Join(tmpDir, "soroforge.db")
+
+		s, err := store.NewSQLite(context.Background(), path)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+		// A migrated SQLite database is required by the suite because the schema
+		// is Postgres-flavoured (identity columns, the action check constraint).
+		migrator, err := store.NewMigrator(store.DSNForSQLite(path))
+		require.NoError(t, err)
+		require.NoError(t, migrator.Up())
+		require.NoError(t, migrator.Close())
+
+		return s
+	})
+}
+
 func TestActionValid(t *testing.T) {
 	assert.True(t, store.ActionDeploy.Valid())
 	assert.True(t, store.ActionUpgrade.Valid())
@@ -320,4 +346,75 @@ func TestDeploymentValidate(t *testing.T) {
 		upload.ContractID = ""
 		assert.NoError(t, upload.Validate())
 	})
+}
+
+func TestSQLiteStoreRejectsBadPath(t *testing.T) {
+	_, err := store.NewSQLite(context.Background(), "")
+	require.ErrorContains(t, err, "database path is required")
+}
+
+func TestSQLiteMigrationsAreReversible(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "migrations.db")
+	url := store.DSNForSQLite(path)
+
+	migrator, err := store.NewMigrator(url)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, migrator.Close()) }()
+
+	require.NoError(t, migrator.Up())
+
+	version, dirty, err := migrator.Version()
+	require.NoError(t, err)
+	require.False(t, dirty, "migrations must not leave the database dirty")
+	require.Equal(t, uint(2), version)
+
+	truncateSQLiteDB(t, path)
+
+	require.NoError(t, migrator.Down())
+	require.NoError(t, migrator.Up())
+}
+
+func truncateSQLiteDB(t *testing.T, path string) {
+	t.Helper()
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite", path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	_, err = db.ExecContext(ctx, "DELETE FROM deployments")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "DELETE FROM contracts")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "DELETE FROM sqlite_sequence WHERE name IN ('contracts', 'deployments')")
+	require.NoError(t, err)
+}
+
+// The two dialects must stay at parity: the same migration versions, in the
+// same order, so a schema change cannot land on one backend only.
+func TestMigrationsStayAtParity(t *testing.T) {
+	fs := store.MigrationsFS()
+
+	names := func(dir string) []string {
+		entries, err := fs.ReadDir(dir)
+		require.NoError(t, err)
+		out := make([]string, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, e.Name())
+		}
+		return out
+	}
+
+	postgres := names("migrations/postgres")
+	sqlite := names("migrations/sqlite")
+
+	require.NotEmpty(t, postgres)
+	assert.Equal(t, postgres, sqlite, "both dialects must ship the same migration files")
+}
+
+func TestSQLitePathFromDSN(t *testing.T) {
+	assert.Equal(t, "/tmp/history.db", store.SQLitePath("sqlite:///tmp/history.db"))
+	assert.Equal(t, "history.db", store.SQLitePath("sqlite://history.db"))
+	assert.Equal(t, "sqlite:///tmp/history.db", store.DSNForSQLite("/tmp/history.db"))
 }

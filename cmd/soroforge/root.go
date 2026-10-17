@@ -191,12 +191,24 @@ func newApp(ctx context.Context, opts appOptions) (*app, error) {
 			return nil, err
 		}
 
-		pg, err := store.NewPostgres(ctx, databaseURL)
-		if err != nil {
-			return nil, err
+		// sqlite:// selects the single-file store; every other scheme is a
+		// Postgres connection string. Both are Stores, so nothing downstream
+		// needs to know which one a project chose.
+		if strings.HasPrefix(databaseURL, store.SQLiteScheme) {
+			db, err := store.NewSQLite(ctx, store.SQLitePath(databaseURL))
+			if err != nil {
+				return nil, err
+			}
+			a.store = db
+			a.closers = append(a.closers, db.Close)
+		} else {
+			pg, err := store.NewPostgres(ctx, databaseURL)
+			if err != nil {
+				return nil, err
+			}
+			a.store = pg
+			a.closers = append(a.closers, pg.Close)
 		}
-		a.store = pg
-		a.closers = append(a.closers, pg.Close)
 	}
 
 	signer, err := buildSigner(cfg, opts.requireSigner)
