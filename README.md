@@ -159,6 +159,21 @@ contract address a real deploy would produce, and submits and records nothing:
 
 A dry run doesn't need `DATABASE_URL`, so it doubles as a config check.
 
+**Solo or team?** Postgres is the right default: `serve`, concurrent writers and
+long-lived deployment history all assume it. If you are one developer tracking
+your own deploys, SQLite needs nothing running at all —
+
+```bash
+export DATABASE_URL=sqlite:///home/you/.soroforge/history.db
+./bin/soroforge migrate up
+```
+
+The file is created on first use, the schema is migrated by the SQLite
+migration set, and every command works the same. The driver is pure Go
+(`modernc.org/sqlite`), so `CGO_ENABLED=0` builds keep working. The two
+dialects' migrations are kept at parity by a test, and Postgres remains the
+choice for anything shared.
+
 **5. Deploy for real.**
 
 ```bash
@@ -284,16 +299,33 @@ contracts:
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | Postgres connection string. Required except for `deploy --dry-run`. |
+| `DATABASE_URL` | Postgres connection string, or `sqlite:///path/to/file.db` for the single-file store. Required except for `deploy --dry-run`. |
 | `SOROFORGE_SECRET_KEY` | Deployer secret seed (`S...`). |
 | `SOROFORGE_KEYSTORE_PATH` | Path to a file containing only the seed. |
 | `SOROFORGE_API_TOKEN` | Read-write bearer token for `serve`. |
 | `SOROFORGE_API_TOKENS` | Scoped bearer tokens for `serve`, as `name:scope:token` entries — see below. |
+| `SOROFORGE_API_CORS_ORIGINS` | Comma-separated exact origins allowed to call `serve` from a browser. Unset (default) sends no CORS headers. |
 | `SOROFORGE_API_ADDR` | Listen address (default `127.0.0.1:8080`). |
 | `SOROFORGE_LOG_FORMAT` | `text` (default) or `json`; same as `--log-format`. |
 | `SOROFORGE_CONFIG` | Config file path (default `./soroforge.yaml`). |
 | `TEST_DATABASE_URL` | Enables Postgres integration tests. |
 | `SOROFORGE_LIVE` | Enables the live testnet smoke tests. |
+
+**Browser dashboards (CORS).** By default the API sends no CORS headers, so
+only same-origin or non-browser clients can call it. Set
+`SOROFORGE_API_CORS_ORIGINS` to a comma-separated list of the exact origins
+your dashboard is served from to allow cross-origin calls:
+
+```bash
+SOROFORGE_API_CORS_ORIGINS="https://dash.example.com,https://ops.example.com"
+```
+
+This is an explicit, narrow opt-in on purpose: the API can deploy contracts
+with the configured signing key, so `*` is rejected with an error at startup —
+every origin must be listed exactly, as `scheme://host[:port]` with no path,
+trailing slash, or wildcard. Preflight requests are answered without a bearer
+token (browsers never send one); actual requests still require authentication
+regardless of origin.
 
 ---
 
