@@ -159,13 +159,50 @@ func (s *SQLite) ListContracts(ctx context.Context, network string) ([]Contract,
 	return contracts, nil
 }
 
+// sqliteListContractsPageSQL filters in SQL rather than in Go, because paging
+// must count only the rows of the requested network. An empty network matches
+// every network, as the Postgres query does.
+const sqliteListContractsPageSQL = `
+SELECT id, alias, network, contract_id, current_wasm_hash, created_at, updated_at
+FROM contracts
+WHERE ($1 = '' OR network = $1)
+ORDER BY network, alias
+LIMIT $2 OFFSET $3`
+
+// ListContractsPage implements Store.
+func (s *SQLite) ListContractsPage(ctx context.Context, network string, limit, offset int) ([]Contract, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, sqliteListContractsPageSQL, network, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list contracts page: %w", err)
+	}
+	defer rows.Close()
+
+	contracts := []Contract{}
+	for rows.Next() {
+		c, err := scanContract(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list contracts page: %w", err)
+		}
+		contracts = append(contracts, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list contracts page: %w", err)
+	}
+	return contracts, nil
+}
+
 const sqliteRecordDeploymentSQL = `
 INSERT INTO deployments (
-    alias, network, contract_id, wasm_hash, action, deployer_pubkey, tx_hash, ledger, notes, created_at
+    alias, network, contract_id, wasm_hash, action, deployer_pubkey, tx_hash, ledger,
+    git_commit, dirty, fee_charged, notes, ci_run_url, fn_name, fn_args, created_at
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, coalesce((SELECT created_at FROM deployments WHERE id = -1), CURRENT_TIMESTAMP))
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CURRENT_TIMESTAMP)
 RETURNING id, alias, network, contract_id, wasm_hash, action,
-          deployer_pubkey, tx_hash, ledger, notes, created_at`
+          deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged,
+          notes, ci_run_url, fn_name, fn_args, created_at`
 
 // RecordDeployment implements Store.
 func (s *SQLite) RecordDeployment(ctx context.Context, d Deployment) (Deployment, error) {
@@ -181,14 +218,21 @@ func (s *SQLite) RecordDeployment(ctx context.Context, d Deployment) (Deployment
 	if d.Ledger != 0 {
 		ledger = sql.NullInt64{Int64: int64(d.Ledger), Valid: true}
 	}
-	var notes sql.NullString
-	if d.Notes != "" {
-		notes = sql.NullString{String: d.Notes, Valid: true}
+	// The optional columns follow the Postgres store's rules exactly, so the
+	// conformance suite sees the same NULLs from both dialects.
+	var feeCharged sql.NullInt64
+	if d.FeeCharged != nil {
+		feeCharged = sql.NullInt64{Int64: *d.FeeCharged, Valid: true}
+	}
+	var dirty sql.NullBool
+	if d.GitCommit != "" {
+		dirty = sql.NullBool{Bool: d.Dirty, Valid: true}
 	}
 
 	row := s.db.QueryRowContext(ctx, sqliteRecordDeploymentSQL,
 		d.Alias, d.Network, d.ContractID, d.WasmHash, string(d.Action),
-		d.DeployerPubkey, txHash, ledger, notes)
+		d.DeployerPubkey, txHash, ledger, nullString(d.GitCommit), dirty, feeCharged,
+		nullString(d.Notes), nullString(d.CIRunURL), nullString(d.FnName), nullString(d.FnArgs))
 
 	out, err := scanDeployment(row)
 	if err != nil {
@@ -197,12 +241,48 @@ func (s *SQLite) RecordDeployment(ctx context.Context, d Deployment) (Deployment
 	return out, nil
 }
 
+// nullString stores an empty optional field as NULL, as the Postgres store does.
+func nullString(v string) sql.NullString {
+	return sql.NullString{String: v, Valid: v != ""}
+}
+
 const sqliteHistorySQL = `
 SELECT id, alias, network, contract_id, wasm_hash, action,
-       deployer_pubkey, tx_hash, ledger, notes, created_at
+       deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged,
+       notes, ci_run_url, fn_name, fn_args, created_at
 FROM deployments
 WHERE network = $1 AND alias = $2
 ORDER BY created_at DESC, id DESC`
+
+// sqliteHistoryPageSQL is sqliteHistorySQL with paging, kept in the same
+// newest-first order so pages concatenate to the full history.
+const sqliteHistoryPageSQL = sqliteHistorySQL + `
+LIMIT $3 OFFSET $4`
+
+// HistoryPage implements Store.
+func (s *SQLite) HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]Deployment, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, sqliteHistoryPageSQL, network, alias, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("history page for %s/%s: %w", network, alias, err)
+	}
+	defer rows.Close()
+
+	deployments := []Deployment{}
+	for rows.Next() {
+		d, err := scanDeployment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("history page for %s/%s: %w", network, alias, err)
+		}
+		deployments = append(deployments, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history page for %s/%s: %w", network, alias, err)
+	}
+	return deployments, nil
+}
 
 // History implements Store.
 //

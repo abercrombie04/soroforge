@@ -16,6 +16,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -140,7 +141,9 @@ func (m *Migrator) Close() error {
 // given file path. It is exported so that tests and the migrator can open the
 // same file with the same pure-Go driver without passing internal types around.
 func DSNForSQLite(path string) string {
-	return SQLiteScheme + path
+	// ToSlash keeps a Windows path such as C:\x\h.db parseable as a URL; it is a
+	// no-op elsewhere.
+	return SQLiteScheme + filepath.ToSlash(path)
 }
 
 // migrationsDir names the embedded dialect directory for a DSN.

@@ -466,7 +466,7 @@ func TestSQLiteMigrationsAreReversible(t *testing.T) {
 	version, dirty, err := migrator.Version()
 	require.NoError(t, err)
 	require.False(t, dirty, "migrations must not leave the database dirty")
-	require.Equal(t, uint(2), version)
+	require.Equal(t, uint(4), version)
 
 	truncateSQLiteDB(t, path)
 
