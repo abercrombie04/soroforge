@@ -1,22 +1,10 @@
-// Package store persists SoroForge's deployment history.
-//
-// The history is the point of the tool: it answers "which WASM hash is live on
-// which network, and who put it there" long after the terminal that ran the
-// deploy is gone. Two tables back that — contracts holds current state, and
-// deployments is an append-only log of every deploy, upgrade, and upload.
-//
-// Everything is namespaced by network. A contract alias means nothing on its
-// own; "counter on testnet" and "counter on mainnet" are separate records with
-// separate lifecycles, and no query in this package crosses that boundary
-// implicitly.
 package store
 
 import (
-	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
-	"path/filepath"
+	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -25,25 +13,32 @@ import (
 	// the postgres:// scheme in DATABASE_URL.
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 
-	// Registers the sqlite scheme so the sqlite:// DSN that DSNForSQLite builds
-	// resolves. This is the same modernc.org/sqlite driver SQLiteStore opens,
-	// so migrations and the store agree on the file format without cgo.
+	// Registers the sqlite driver resolved from the sqlite:// scheme. It is
+	// built on modernc.org/sqlite, the pure-Go driver, so CGO stays off.
 	_ "github.com/golang-migrate/migrate/v4/database/sqlite"
-
-	_ "modernc.org/sqlite"
 )
 
-// Migrations are embedded per dialect so a built binary carries its own schema
-// and `soroforge migrate up` works from a single file with nothing to copy
-// alongside it — which matters when the binary runs in a CI container.
+// Two migration sets live side by side, one per SQL dialect:
 //
-// Two trees rather than one because the dialects disagree on DDL that matters
-// here: Postgres uses identity columns and TIMESTAMPTZ, SQLite cannot, so a
-// shared file would only run on one of them.
+//	migrations/postgres/  the production schema
+//	migrations/sqlite/    the same tables and columns, phrased for SQLite
 //
-//go:embed migrations/postgres/*.sql
-//go:embed migrations/sqlite/*.sql
+// They share version numbers and file basenames — migration N is applied
+// under whichever directory the URL selects — and a test in this package
+// asserts the two dialects end up with the same table and column sets, so a
+// migration added for one backend cannot silently skip the other.
+//
+//go:embed migrations/postgres/*.sql migrations/sqlite/*.sql
 var migrationsFS embed.FS
+
+// SQLiteURLPrefix is the DATABASE_URL scheme that selects the SQLite store.
+// A URL like sqlite:///home/me/history.db opens (and migrates) that file.
+const SQLiteURLPrefix = "sqlite://"
+
+// IsSQLiteURL reports whether a DATABASE_URL selects SQLite.
+func IsSQLiteURL(databaseURL string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(databaseURL)), SQLiteURLPrefix)
+}
 
 // Migrator applies schema migrations.
 type Migrator struct {
@@ -52,49 +47,28 @@ type Migrator struct {
 
 // NewMigrator prepares migrations against the given database URL.
 //
-// It takes a URL rather than the pgx pool because golang-migrate needs its own
-// database/sql handle; sharing the pool is not supported.
+// It takes a URL rather than a Store because golang-migrate needs its own
+// database/sql handle; sharing the pgx pool is not supported.
 func NewMigrator(databaseURL string) (*Migrator, error) {
 	if databaseURL == "" {
 		return nil, fmt.Errorf("migrate: database URL is required")
 	}
 
-	// Register the SQLite driver once, before the first migrator is opened.
-	// golang-migrate opens its own database/sql connection from the DSN; for
-	// the sqlite:// scheme that connection needs a registered "sqlite" driver,
-	// and this package's init alone is not dependable across toolchains.
-	if isSQLiteURL(databaseURL) {
-		ensureSQLiteDriverRegistered()
+	sourceDir := "migrations/postgres"
+	if IsSQLiteURL(databaseURL) {
+		sourceDir = "migrations/sqlite"
 	}
 
-	source, err := iofs.New(migrationsFS, migrationsDir(databaseURL))
+	source, err := iofs.New(migrationsFS, sourceDir)
 	if err != nil {
 		return nil, fmt.Errorf("migrate: load embedded migrations: %w", err)
 	}
 
-	mig, err := migrate.NewWithSourceInstance("iofs", source, databaseURL)
+	m, err := migrate.NewWithSourceInstance("iofs", source, databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("migrate: open database: %w", err)
 	}
-
-	return &Migrator{m: mig}, nil
-}
-
-// isSQLiteURL reports whether databaseURL is a sqlite:// DSN that NewMigrator
-// will hand to modernc.org/sqlite.
-func isSQLiteURL(databaseURL string) bool {
-	return len(databaseURL) > len(SQLiteScheme) && databaseURL[:len(SQLiteScheme)] == SQLiteScheme
-}
-
-// ensureSQLiteDriverRegistered exists only to pull modernc.org/sqlite into the
-// link so that the sqlite:// DSN used by the migrator resolves at runtime
-// without a forgotten-import error.
-func ensureSQLiteDriverRegistered() {
-	// modernc.org/sqlite registers itself with database/sql under "sqlite" via
-	// its init. This function is called from NewMigrator when the DSN scheme is
-	// sqlite://, so the driver is registered before golang-migrate asks
-	// database/sql to open it.
-	_, _ = sql.Open("sqlite", "")
+	return &Migrator{m: m}, nil
 }
 
 // Up applies all pending migrations. Applying an already-current schema is not
@@ -137,23 +111,6 @@ func (m *Migrator) Close() error {
 	return errors.Join(sourceErr, dbErr)
 }
 
-// DSNForSQLite returns a DSN for the modernc.org/sqlite-backed store at the
-// given file path. It is exported so that tests and the migrator can open the
-// same file with the same pure-Go driver without passing internal types around.
-func DSNForSQLite(path string) string {
-	// ToSlash keeps a Windows path such as C:\x\h.db parseable as a URL; it is a
-	// no-op elsewhere.
-	return SQLiteScheme + filepath.ToSlash(path)
-}
-
-// migrationsDir names the embedded dialect directory for a DSN.
-func migrationsDir(databaseURL string) string {
-	if isSQLiteURL(databaseURL) {
-		return "migrations/sqlite"
-	}
-	return "migrations/postgres"
-}
-
-// MigrationsFS exposes the embedded migrations, with a directory per dialect,
-// for tests that check the two stay at parity or build a schema directly.
+// MigrationsFS exposes the embedded migrations for tests that build a schema
+// directly and for the dialect-parity check.
 func MigrationsFS() embed.FS { return migrationsFS }

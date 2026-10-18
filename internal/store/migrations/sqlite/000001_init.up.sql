@@ -1,8 +1,18 @@
--- SoroForge deployment history, SQLite dialect.
+-- SoroForge deployment history (SQLite dialect).
 --
--- Same two tables and the same constraints as the Postgres migration, written
--- for SQLite: integer autoincrement keys instead of identity columns, and
--- TIMESTAMP (parsed to time.Time by modernc.org/sqlite) instead of TIMESTAMPTZ.
+-- Mirrors migrations/postgres/000001_init.up.sql table for table, column for
+-- column; a test asserts the two dialects stay in parity. Dialect choices:
+--
+--   * BIGINT GENERATED ALWAYS AS IDENTITY becomes INTEGER PRIMARY KEY
+--     AUTOINCREMENT — SQLite's rowid alias, the idiomatic identity column.
+--   * TIMESTAMPTZ becomes TEXT holding a fixed-width UTC RFC3339 timestamp
+--     with microsecond precision. Fixed width matters: history sorts by
+--     created_at, and SQLite compares TEXT lexicographically, so variable-
+--     length fractional seconds would misorder rows. Microseconds match
+--     Postgres' timestamp resolution, so an exported history re-imports into
+--     either backend without silent truncation differences.
+--   * now() defaults are strftime(...) in UTC; the Go store supplies explicit
+--     timestamps on every write, so the defaults only guard hand-edited files.
 
 CREATE TABLE IF NOT EXISTS contracts (
     id                INTEGER     PRIMARY KEY AUTOINCREMENT,
@@ -10,8 +20,8 @@ CREATE TABLE IF NOT EXISTS contracts (
     network           TEXT        NOT NULL,
     contract_id       TEXT        NOT NULL,
     current_wasm_hash TEXT        NOT NULL,
-    created_at        TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at        TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at        TEXT        NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at        TEXT        NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 
     -- An alias identifies a contract only within a network: "counter" on
     -- testnet and "counter" on mainnet are independent deployments.
@@ -29,7 +39,7 @@ CREATE TABLE IF NOT EXISTS deployments (
     tx_hash         TEXT,
     ledger          INTEGER,
     notes           TEXT,
-    created_at      TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at      TEXT        NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 
     CONSTRAINT deployments_action_check CHECK (action IN ('deploy', 'upgrade'))
 );

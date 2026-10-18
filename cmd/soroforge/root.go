@@ -77,10 +77,12 @@ The secret key is never logged, stored, or printed. See the README security note
 		newListCmd(),
 		newHistoryCmd(),
 		newStatusCmd(),
+		newNetworksCmd(),
 		newServeCmd(),
 		newMigrateCmd(),
 		newVersionCmd(),
 	)
+	registerNetworkFlagCompletion(cmd)
 
 	return cmd
 }
@@ -192,24 +194,14 @@ func newApp(ctx context.Context, opts appOptions) (*app, error) {
 			return nil, err
 		}
 
-		// sqlite:// selects the single-file store; every other scheme is a
-		// Postgres connection string. Both are Stores, so nothing downstream
-		// needs to know which one a project chose.
-		if strings.HasPrefix(databaseURL, store.SQLiteScheme) {
-			db, err := store.NewSQLite(ctx, store.SQLitePath(databaseURL))
-			if err != nil {
-				return nil, err
-			}
-			a.store = db
-			a.closers = append(a.closers, db.Close)
-		} else {
-			pg, err := store.NewPostgres(ctx, databaseURL)
-			if err != nil {
-				return nil, err
-			}
-			a.store = pg
-			a.closers = append(a.closers, pg.Close)
+		// Open dispatches on the URL scheme: sqlite://... is the file-backed
+		// store, anything else Postgres.
+		st, err := store.Open(ctx, databaseURL)
+		if err != nil {
+			return nil, err
 		}
+		a.store = st
+		a.closers = append(a.closers, st.Close)
 	}
 
 	signer, err := buildSigner(cfg, opts.requireSigner)
