@@ -107,6 +107,10 @@ type Options struct {
 
 	// Log defaults to slog.Default().
 	Log *slog.Logger
+
+	// JobRetention is how long finished async jobs stay fetchable. Defaults to
+	// DefaultJobRetention; tests shorten it.
+	JobRetention time.Duration
 }
 
 // route is one endpoint, the scope a token must hold to call it, and its
@@ -137,6 +141,8 @@ func (h *handlers) routes() []route {
 
 		{http.MethodPost, "/v1/deploy", ScopeWrite, h.deploy},
 		{http.MethodPost, "/v1/upgrade", ScopeWrite, h.upgrade},
+
+		{http.MethodGet, "/v1/jobs/{id}", ScopeRead, h.job},
 
 		{http.MethodGet, "/v1/contracts", ScopeRead, h.listContracts},
 		{http.MethodGet, "/v1/contracts/{network}/{alias}/history", ScopeRead, h.history},
@@ -178,7 +184,12 @@ func NewRouter(opts Options) (http.Handler, error) {
 		log = slog.Default()
 	}
 
-	h := &handlers{svc: opts.Service, readiness: opts.Readiness, log: log}
+	h := &handlers{
+		svc:       opts.Service,
+		readiness: opts.Readiness,
+		log:       log,
+		jobs:      newJobManager(opts.JobRetention, log),
+	}
 	auth := &authenticator{tokens: opts.Tokens}
 
 	r := chi.NewRouter()
@@ -296,6 +307,7 @@ type handlers struct {
 	svc       Service
 	readiness Readiness
 	log       *slog.Logger
+	jobs      *jobManager
 }
 
 // errorResponse is the body returned for every failure, so clients can parse
