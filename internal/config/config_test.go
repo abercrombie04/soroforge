@@ -17,6 +17,7 @@ networks:
     rpc_url: https://soroban-testnet.stellar.org
     passphrase: "Test SDF Network ; September 2015"
     sorovault_url: http://localhost:8080
+    explorer_url: https://stellar.expert/explorer/testnet
   mainnet:
     rpc_url: https://mainnet.example.org
     passphrase: "Public Global Stellar Network ; September 2015"
@@ -48,7 +49,36 @@ func TestLoadValidConfig(t *testing.T) {
 	assert.Len(t, cfg.Networks, 2)
 	assert.Len(t, cfg.Contracts, 2)
 	assert.Equal(t, "http://localhost:8080", cfg.Networks["testnet"].SoroVaultURL)
+	assert.Equal(t, "https://stellar.expert/explorer/testnet", cfg.Networks["testnet"].ExplorerURL)
+	assert.Equal(t, "https://stellar.expert/explorer/testnet/contract/C123",
+		cfg.Networks["testnet"].ContractExplorerURL("C123"))
+	assert.Equal(t, "https://stellar.expert/explorer/testnet/tx/ABC",
+		cfg.Networks["testnet"].TransactionExplorerURL("ABC"))
 	assert.Empty(t, cfg.Networks["mainnet"].SoroVaultURL, "the registry is optional per network")
+	assert.Empty(t, cfg.Networks["mainnet"].ContractExplorerURL("C123"))
+	assert.False(t, cfg.Networks["mainnet"].Protected,
+		"networks are unprotected unless marked; testnet flows stay prompt-free")
+}
+
+func TestProtectedNetworksParse(t *testing.T) {
+	cfg, err := parse([]byte(`
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://soroban-testnet.stellar.org
+    passphrase: "Test SDF Network ; September 2015"
+  mainnet:
+    rpc_url: https://mainnet.example.org
+    passphrase: "Public Global Stellar Network ; September 2015"
+    protected: true
+contracts:
+  counter:
+    wasm: ./out/counter.wasm
+`))
+	require.NoError(t, err, "protected is a recognized network key")
+	assert.True(t, cfg.Networks["mainnet"].Protected)
+	assert.False(t, cfg.Networks["testnet"].Protected)
 }
 
 func TestNetworkLookupFallsBackToDefault(t *testing.T) {
@@ -99,6 +129,70 @@ func TestUpgradeFuncDefaultAndOverride(t *testing.T) {
 	token, err := cfg.Contract("token")
 	require.NoError(t, err)
 	assert.Equal(t, "admin_upgrade", token.UpgradeFuncOrDefault())
+}
+
+const perNetworkConfig = `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://soroban-testnet.stellar.org
+    passphrase: "Test SDF Network ; September 2015"
+  mainnet:
+    rpc_url: https://mainnet.example.org
+    passphrase: "Public Global Stellar Network ; September 2015"
+contracts:
+  token:
+    wasm: ./out/token.wasm
+    constructor_args:
+      - {type: string, value: "default-admin"}
+    salt: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    networks:
+      mainnet:
+        constructor_args:
+          - {type: string, value: "mainnet-admin"}
+        salt: "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+      testnet:
+        constructor_args: []
+`
+
+func TestForNetworkAppliesOverridesOnTopOfDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, perNetworkConfig))
+	require.NoError(t, err)
+
+	contract, err := cfg.Contract("token")
+	require.NoError(t, err)
+
+	mainnet := contract.ForNetwork("mainnet")
+	require.Len(t, mainnet.ConstructorArgs, 1)
+	value, err := mainnet.ConstructorArgs[0].Value.asString()
+	require.NoError(t, err)
+	assert.Equal(t, "mainnet-admin", value)
+	assert.Equal(t,
+		"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+		mainnet.Salt)
+
+	// An explicit empty list is an override, not an absence of one: testnet
+	// deploys with no constructor arguments even though the contract has one.
+	testnet := contract.ForNetwork("testnet")
+	assert.Empty(t, testnet.ConstructorArgs)
+	assert.Equal(t, contract.Salt, testnet.Salt, "an unset field inherits the contract default")
+
+	// The original contract value is untouched; resolution returns a copy.
+	assert.Equal(t, contract.ConstructorArgs, contract.ForNetwork("nonexistent").ConstructorArgs)
+}
+
+func TestForNetworkWithoutOverridesReturnsDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validConfig))
+	require.NoError(t, err)
+
+	counter, err := cfg.Contract("counter")
+	require.NoError(t, err)
+
+	resolved := counter.ForNetwork("mainnet")
+	assert.Equal(t, counter.Wasm, resolved.Wasm)
+	assert.Equal(t, counter.UpgradeFunc, resolved.UpgradeFunc)
+	assert.Equal(t, counter.ConstructorArgs, resolved.ConstructorArgs)
 }
 
 func TestWasmPathResolvesRelativeToConfigFile(t *testing.T) {
@@ -230,6 +324,20 @@ contracts:
 `,
 			wantErr: "networks.testnet.sorovault_url",
 		},
+		"explorer url without scheme": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+    explorer_url: explorer.example.org
+contracts:
+  counter: {wasm: ./c.wasm}
+`,
+			wantErr: "networks.testnet.explorer_url",
+		},
 		"contract without wasm": {
 			config: `
 version: 1
@@ -259,6 +367,56 @@ contracts:
 `,
 			wantErr: "constructor_args[0]",
 		},
+		"both constructor_args and init_fn": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  counter:
+    wasm: ./c.wasm
+    constructor_args:
+      - {type: u32, value: 7}
+    init_fn: initialize
+`,
+			wantErr: "cannot configure both constructor_args and init_fn",
+		},
+		"init_args without init_fn": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  counter:
+    wasm: ./c.wasm
+    init_args:
+      - {type: u32, value: 7}
+`,
+			wantErr: "init_args: init_fn must be set",
+		},
+		"invalid init_args": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  counter:
+    wasm: ./c.wasm
+    init_fn: initialize
+    init_args:
+      - {type: u32, value: "not a number"}
+`,
+			wantErr: "init_args[0]",
+		},
 		"invalid salt": {
 			config: `
 version: 1
@@ -274,6 +432,58 @@ contracts:
 `,
 			wantErr: "salt",
 		},
+		"unknown network in override": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  counter:
+    wasm: ./c.wasm
+    networks:
+      staging:
+        salt: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+`,
+			wantErr: "contracts.counter.networks.staging: unknown network (configured: testnet)",
+		},
+		"invalid constructor arg inside override": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  counter:
+    wasm: ./c.wasm
+    networks:
+      testnet:
+        constructor_args:
+          - {type: u32, value: "not a number"}
+`,
+			wantErr: "contracts.counter.networks.testnet.constructor_args[0]",
+		},
+		"invalid salt inside override": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  counter:
+    wasm: ./c.wasm
+    networks:
+      testnet:
+        salt: "abcd"
+`,
+			wantErr: "contracts.counter.networks.testnet.salt",
+		},
 		"default_network not configured": {
 			config: `
 version: 1
@@ -287,6 +497,66 @@ contracts:
 `,
 			wantErr: "is not one of the configured networks",
 		},
+		"wasm and asset mutually exclusive": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  sac:
+    wasm: ./c.wasm
+    asset: native
+`,
+			wantErr: "wasm and asset are mutually exclusive",
+		},
+		"invalid asset format": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  sac:
+    asset: "INVALID:ASSET:FORMAT"
+`,
+			wantErr: "contracts.sac.asset",
+		},
+		"sac with constructor args": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  sac:
+    asset: native
+    constructor_args:
+      - {type: u32, value: 42}
+`,
+			wantErr: "Stellar Asset Contracts do not take constructor args",
+		},
+		"sac with salt": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  sac:
+    asset: native
+    salt: "0000000000000000000000000000000000000000000000000000000000000001"
+`,
+			wantErr: "salt cannot be used",
+		},
 	}
 
 	for name, tc := range tests {
@@ -295,6 +565,34 @@ contracts:
 			assert.ErrorContains(t, err, tc.wantErr)
 		})
 	}
+}
+
+func TestValidateAcceptsSAC(t *testing.T) {
+	config := `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  xlm:
+    asset: native
+  usdc:
+    asset: "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+`
+	cfg, err := Load(writeConfig(t, config))
+	require.NoError(t, err)
+
+	xlm, err := cfg.Contract("xlm")
+	require.NoError(t, err)
+	assert.True(t, xlm.IsSAC())
+	assert.Equal(t, "native", xlm.Asset)
+
+	usdc, err := cfg.Contract("usdc")
+	require.NoError(t, err)
+	assert.True(t, usdc.IsSAC())
+	assert.Equal(t, "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", usdc.Asset)
 }
 
 func TestValidateAcceptsMissingWasmFile(t *testing.T) {
@@ -309,4 +607,66 @@ func TestValidateAcceptsMissingWasmFile(t *testing.T) {
 
 	_, statErr := os.Stat(cfg.WasmPath(contract))
 	assert.True(t, os.IsNotExist(statErr), "the artifact genuinely does not exist")
+}
+
+func TestWebhooksParseBothForms(t *testing.T) {
+	// A network may list webhooks as bare URLs or as {url, secret} mappings;
+	// both must land in Network.Webhooks.
+	cfg, err := Load(writeConfig(t, `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+    webhooks:
+      - https://hooks.example.org/a
+      - url: https://internal.example.org/b
+        secret: shared
+contracts:
+  counter: {wasm: ./c.wasm}
+`))
+	require.NoError(t, err)
+
+	assert.Equal(t, []Webhook{
+		{URL: "https://hooks.example.org/a"},
+		{URL: "https://internal.example.org/b", Secret: "shared"},
+	}, cfg.Networks["testnet"].Webhooks)
+}
+
+func TestWebhookValidation(t *testing.T) {
+	tests := map[string]struct {
+		entries string
+		wantErr string
+	}{
+		"non-http scheme": {
+			entries: "      - ftp://hooks.example.org/a\n",
+			wantErr: "networks.testnet.webhooks[0].url: scheme must be http or https",
+		},
+		"missing host": {
+			entries: "      - \"https://\"\n",
+			wantErr: "networks.testnet.webhooks[0].url: missing host",
+		},
+		"empty url in mapping": {
+			entries: "      - url: https://ok.example.org\n      - {secret: s}\n",
+			wantErr: "networks.testnet.webhooks[1].url: must be set",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+    webhooks:
+`+tc.entries+`contracts:
+  counter: {wasm: ./c.wasm}
+`))
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
 }

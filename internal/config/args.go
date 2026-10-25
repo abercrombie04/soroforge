@@ -1,17 +1,21 @@
 package config
 
 import (
+	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
+	"gopkg.in/yaml.v3"
 )
 
-// Arg is a contract argument written in soroforge.yaml.
+// Arg is a contract argument written in soroforge.yaml or an --args-file.
 //
 // Soroban takes arguments as XDR ScVal values, which are not something anyone
 // wants to hand-write. An Arg is the readable form:
@@ -29,32 +33,47 @@ import (
 //
 //   - {type: xdr, value: "AAAAAQ=="}
 //
+// A special "contract" type references another contract by its alias, which
+// resolves to that contract's tracked address on the target network. This is
+// useful for passing a token address to a pool constructor, for example:
+//
+//   - {type: address, contract: token }
+//
 // To add a type, write an encoder and register it in argTypeRegistry, then add
 // a case to the table test in args_test.go — a test asserts every registered
 // type has one. SupportedArgTypes, and therefore every "supported: ..."
 // error message, is derived from the registry, so nothing else needs to change.
 type Arg struct {
-	Type  string `yaml:"type"`
-	Value Value  `yaml:"value"`
+	Type  string `yaml:"type" json:"type"`
+	Value Value  `yaml:"value" json:"value"`
+
+	// ContractRef holds the alias of another contract when Type is "contract".
+	// It is resolved to the contract's tracked address at deploy time.
+	ContractRef string `yaml:"contract,omitempty" json:"contract,omitempty"`
 }
 
 // Supported Arg type names.
 const (
-	ArgBool    = "bool"
-	ArgVoid    = "void"
-	ArgU32     = "u32"
-	ArgI32     = "i32"
-	ArgU64     = "u64"
-	ArgI64     = "i64"
-	ArgU128    = "u128"
-	ArgI128    = "i128"
-	ArgString  = "string"
-	ArgSymbol  = "symbol"
-	ArgBytes   = "bytes"
-	ArgAddress = "address"
-	ArgVec     = "vec"
-	ArgMap     = "map"
-	ArgXDR     = "xdr"
+	ArgBool      = "bool"
+	ArgVoid      = "void"
+	ArgU32       = "u32"
+	ArgI32       = "i32"
+	ArgU64       = "u64"
+	ArgI64       = "i64"
+	ArgU128      = "u128"
+	ArgI128      = "i128"
+	ArgU256      = "u256"
+	ArgI256      = "i256"
+	ArgTimepoint = "timepoint"
+	ArgDuration  = "duration"
+	ArgString    = "string"
+	ArgSymbol    = "symbol"
+	ArgBytes     = "bytes"
+	ArgAddress   = "address"
+	ArgContract  = "contract"
+	ArgVec       = "vec"
+	ArgMap       = "map"
+	ArgXDR       = "xdr"
 )
 
 // SupportedArgTypes lists every recognised Arg type, for error messages and docs.
@@ -101,10 +120,15 @@ func init() {
 		{ArgI64, encodeI64},
 		{ArgU128, encodeU128},
 		{ArgI128, encodeI128},
+		{ArgU256, encodeU256},
+		{ArgI256, encodeI256},
+		{ArgTimepoint, encodeTimepoint},
+		{ArgDuration, encodeDuration},
 		{ArgString, encodeString},
 		{ArgSymbol, encodeSymbol},
 		{ArgBytes, encodeBytes},
 		{ArgAddress, encodeAddress},
+		{ArgContract, encodeContractRef},
 		{ArgVec, encodeVec},
 		{ArgMap, encodeMap},
 		{ArgXDR, encodeXDR},
@@ -118,8 +142,8 @@ func init() {
 
 // MapEntry is one key/value pair of a `map` argument.
 type MapEntry struct {
-	Key   Arg `yaml:"key"`
-	Value Arg `yaml:"value"`
+	Key   Arg `yaml:"key" json:"key"`
+	Value Arg `yaml:"value" json:"value"`
 }
 
 // ToScVal converts the argument to its XDR representation.
@@ -209,6 +233,40 @@ func encodeI128(a Arg) (xdr.ScVal, error) {
 	return xdr.ScVal{Type: xdr.ScValTypeScvI128, I128: &parts}, nil
 }
 
+func encodeU256(a Arg) (xdr.ScVal, error) {
+	parts, err := a.Value.asUint256()
+	if err != nil {
+		return xdr.ScVal{}, err
+	}
+	return xdr.ScVal{Type: xdr.ScValTypeScvU256, U256: &parts}, nil
+}
+
+func encodeI256(a Arg) (xdr.ScVal, error) {
+	parts, err := a.Value.asInt256()
+	if err != nil {
+		return xdr.ScVal{}, err
+	}
+	return xdr.ScVal{Type: xdr.ScValTypeScvI256, I256: &parts}, nil
+}
+
+func encodeTimepoint(a Arg) (xdr.ScVal, error) {
+	n, err := a.Value.asUint(64)
+	if err != nil {
+		return xdr.ScVal{}, err
+	}
+	tp := xdr.TimePoint(n)
+	return xdr.ScVal{Type: xdr.ScValTypeScvTimepoint, Timepoint: &tp}, nil
+}
+
+func encodeDuration(a Arg) (xdr.ScVal, error) {
+	n, err := a.Value.asUint(64)
+	if err != nil {
+		return xdr.ScVal{}, err
+	}
+	dur := xdr.Duration(n)
+	return xdr.ScVal{Type: xdr.ScValTypeScvDuration, Duration: &dur}, nil
+}
+
 func encodeString(a Arg) (xdr.ScVal, error) {
 	s, err := a.Value.asString()
 	if err != nil {
@@ -260,7 +318,7 @@ func encodeAddress(a Arg) (xdr.ScVal, error) {
 // index they occurred at.
 func encodeVec(a Arg) (xdr.ScVal, error) {
 	var items []Arg
-	if err := a.Value.decode(&items); err != nil {
+	if err := a.Value.Decode(&items); err != nil {
 		return xdr.ScVal{}, fmt.Errorf("vec: expected a list of args: %w", err)
 	}
 	vec := make(xdr.ScVec, 0, len(items))
@@ -281,7 +339,7 @@ func encodeVec(a Arg) (xdr.ScVal, error) {
 // encodeVec does: one registry, one set of error messages, at any depth.
 func encodeMap(a Arg) (xdr.ScVal, error) {
 	var entries []MapEntry
-	if err := a.Value.decode(&entries); err != nil {
+	if err := a.Value.Decode(&entries); err != nil {
 		return xdr.ScVal{}, fmt.Errorf("map: expected a list of {key, value} pairs: %w", err)
 	}
 	scMap := make(xdr.ScMap, 0, len(entries))
@@ -314,6 +372,13 @@ func encodeXDR(a Arg) (xdr.ScVal, error) {
 	return val, nil
 }
 
+// encodeContractRef is a placeholder encoder for the "contract" type.
+// Contract references must be resolved at deploy time by the deploy package,
+// which has access to the store. Calling this encoder directly is an error.
+func encodeContractRef(Arg) (xdr.ScVal, error) {
+	return xdr.ScVal{}, fmt.Errorf("contract reference must be resolved at deploy time; use deploy.ResolveContractRefs")
+}
+
 // ArgsToScVals converts a list of arguments, reporting which one failed.
 func ArgsToScVals(args []Arg) ([]xdr.ScVal, error) {
 	out := make([]xdr.ScVal, 0, len(args))
@@ -325,6 +390,120 @@ func ArgsToScVals(args []Arg) ([]xdr.ScVal, error) {
 		out = append(out, val)
 	}
 	return out, nil
+}
+
+// ParseArgFlag parses the TYPE:VALUE form used by `deploy --arg`, such as
+// "u32:7" or "string:Example Token". It returns the same Arg the config file
+// uses, so validation is identical to a config-file argument.
+//
+// The colon is a separator, so a value containing one is fine as long as it
+// comes after the type: "string:https://example.org" works. Nested vec and map
+// values cannot be expressed here; use --args-file for those.
+func ParseArgFlag(s string) (Arg, error) {
+	name, raw, found := strings.Cut(s, ":")
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return Arg{}, fmt.Errorf("missing type in %q: expected TYPE:VALUE (supported: %s)",
+			s, strings.Join(SupportedArgTypes, ", "))
+	}
+
+	arg := Arg{Type: name}
+	switch {
+	case found:
+		arg.Value = NewValue(strings.TrimSpace(raw))
+	case strings.EqualFold(name, ArgVoid):
+		// void is the one type that takes no value.
+	default:
+		return Arg{}, fmt.Errorf("missing value in %q: expected TYPE:VALUE (supported: %s)",
+			s, strings.Join(SupportedArgTypes, ", "))
+	}
+
+	// Fail here rather than at deploy time, so a bad flag is rejected before
+	// any transaction is built.
+	if _, err := arg.ToScVal(); err != nil {
+		return Arg{}, err
+	}
+	tagScalarValue(&arg)
+	return arg, nil
+}
+
+// tagScalarValue re-tags a flag-parsed scalar with the YAML type its Arg
+// declares. A flag value always arrives as text; tagging numbers and booleans
+// as such keeps the recorded constructor_args JSON in the same shape a config
+// file would produce, instead of recording everything as a string.
+func tagScalarValue(arg *Arg) {
+	if !arg.Value.set || arg.Value.node.Kind != yaml.ScalarNode {
+		return
+	}
+
+	switch strings.ToLower(strings.TrimSpace(arg.Type)) {
+	case ArgBool:
+		b, err := arg.Value.asBool()
+		if err != nil {
+			return // unreachable: ToScVal validated the value
+		}
+		arg.Value.node.Tag = "!!bool"
+		arg.Value.node.Value = strconv.FormatBool(b)
+	case ArgU32, ArgI32, ArgU64, ArgI64, ArgU128, ArgI128:
+		// A leading + is valid YAML but not JSON; drop it.
+		arg.Value.node.Tag = "!!int"
+		arg.Value.node.Value = strings.TrimPrefix(strings.TrimSpace(arg.Value.node.Value), "+")
+	}
+}
+
+// ParseArgsJSON decodes a JSON array of typed arguments, the `--args-file`
+// form. Each entry uses the same {type, value} shape as soroforge.yaml, so
+// nested vec and map arguments are supported.
+func ParseArgsJSON(raw []byte) ([]Arg, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+
+	var args []Arg
+	if err := dec.Decode(&args); err != nil {
+		return nil, err
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("unexpected trailing data after the argument array")
+	}
+
+	// Validate eagerly so `--args-file` reports the offending entry by index
+	// before a command begins.
+	for i, arg := range args {
+		if _, err := arg.ToScVal(); err != nil {
+			return nil, fmt.Errorf("arg[%d]: %w", i, err)
+		}
+	}
+	return args, nil
+}
+
+// ParseArgsFile reads a JSON file holding an array of typed arguments, the
+// file form of `deploy --arg`. The path is resolved against the process's
+// working directory, not the config file, because the user named it on the
+// command line.
+func ParseArgsFile(path string) ([]Arg, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read args file %s: %w", path, err)
+	}
+	args, err := ParseArgsJSON(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse args file %s: %w", path, err)
+	}
+	return args, nil
+}
+
+// ArgsToJSON renders typed arguments as JSON, the form recorded with a
+// deployment so the arguments actually used can be recovered later. An empty
+// list records nothing, since there is nothing to recover.
+func ArgsToJSON(args []Arg) (string, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		return "", fmt.Errorf("encode args: %w", err)
+	}
+	return string(encoded), nil
 }
 
 // ParseAddress converts a Stellar account (G...) or contract (C...) strkey into
@@ -429,6 +608,44 @@ func parse128(s string, signed bool) (hi uint64, lo uint64, err error) {
 	return hi, lo, nil
 }
 
+// parse256 converts a decimal string into the 64-bit words Soroban uses for
+// 256-bit integers (HiHi, HiLo, LoHi, LoLo). signed selects the valid range.
+//
+// Follows SoroProbe's internal/scval/encode.go two's-complement split into
+// HiHi/HiLo/LoHi/LoLo words.
+func parse256(s string, signed bool) (hiHi, hiLo, loHi, loLo uint64, err error) {
+	n, ok := new(big.Int).SetString(strings.TrimSpace(s), 10)
+	if !ok {
+		return 0, 0, 0, 0, fmt.Errorf("%q is not a valid decimal integer", s)
+	}
+
+	var min, max *big.Int
+	if signed {
+		max = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 255), big.NewInt(1))
+		min = new(big.Int).Neg(new(big.Int).Lsh(big.NewInt(1), 255))
+	} else {
+		max = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+		min = big.NewInt(0)
+	}
+	if n.Cmp(min) < 0 || n.Cmp(max) > 0 {
+		return 0, 0, 0, 0, fmt.Errorf("%s is out of range for a 256-bit %s integer",
+			n.String(), map[bool]string{true: "signed", false: "unsigned"}[signed])
+	}
+
+	// Two's complement for negatives, matching the XDR encoding.
+	// Approach follows SoroProbe's internal/scval/encode.go.
+	if n.Sign() < 0 {
+		n = new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 256), n)
+	}
+
+	mask64 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(1))
+	loLo = new(big.Int).And(n, mask64).Uint64()
+	loHi = new(big.Int).And(new(big.Int).Rsh(n, 64), mask64).Uint64()
+	hiLo = new(big.Int).And(new(big.Int).Rsh(n, 128), mask64).Uint64()
+	hiHi = new(big.Int).Rsh(n, 192).Uint64()
+	return hiHi, hiLo, loHi, loLo, nil
+}
+
 // parseUint and parseInt accept the decimal forms YAML may hand us for an
 // integer field, including a quoted string (which is how anyone writing a value
 // beyond float64's exact range must write it).
@@ -438,4 +655,75 @@ func parseUint(s string, bits int) (uint64, error) {
 
 func parseInt(s string, bits int) (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(s), 10, bits)
+}
+
+// ParseCLIArg parses a command-line string into an Arg.
+//
+// It accepts two forms:
+//  1. Compact type:value syntax, e.g. "u32:7", "string:hello", "address:GABC...", "bool:true", "void"
+//  2. Full YAML/JSON syntax, e.g. "{type: u32, value: 7}", "{type: vec, value: [{type: u32, value: 1}]}"
+func ParseCLIArg(s string) (Arg, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return Arg{}, fmt.Errorf("argument cannot be empty")
+	}
+
+	// Case 1: Full YAML/JSON object
+	if strings.HasPrefix(s, "{") {
+		var a Arg
+		if err := yaml.Unmarshal([]byte(s), &a); err == nil && a.Type != "" {
+			if _, err := a.ToScVal(); err != nil {
+				return Arg{}, err
+			}
+			return a, nil
+		}
+	}
+
+	// Case 2: Special single-keyword "void"
+	if strings.EqualFold(s, ArgVoid) {
+		return Arg{Type: ArgVoid}, nil
+	}
+
+	// Case 3: Compact type:value syntax
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) == 2 {
+		typePart := strings.ToLower(strings.TrimSpace(parts[0]))
+		valPart := strings.TrimSpace(parts[1])
+
+		var yamlStr string
+		switch typePart {
+		case ArgString, ArgU128, ArgI128:
+			if !strings.HasPrefix(valPart, "\"") && !strings.HasPrefix(valPart, "'") {
+				yamlStr = fmt.Sprintf("{type: %s, value: %q}", typePart, valPart)
+			} else {
+				yamlStr = fmt.Sprintf("{type: %s, value: %s}", typePart, valPart)
+			}
+		default:
+			yamlStr = fmt.Sprintf("{type: %s, value: %s}", typePart, valPart)
+		}
+
+		var a Arg
+		if err := yaml.Unmarshal([]byte(yamlStr), &a); err == nil {
+			if _, err := a.ToScVal(); err == nil {
+				return a, nil
+			} else {
+				return Arg{}, fmt.Errorf("invalid %s value %q: %w", typePart, valPart, err)
+			}
+		}
+	}
+
+	return Arg{}, fmt.Errorf("invalid typed argument %q (expected type:value e.g. u32:7 or {type: ..., value: ...})", s)
+}
+
+// ParseCLIArgs converts a slice of command-line argument strings into typed Args.
+func ParseCLIArgs(args []string) ([]Arg, error) {
+	out := make([]Arg, 0, len(args))
+	for i, a := range args {
+		arg, err := ParseCLIArg(a)
+		if err != nil {
+			return nil, fmt.Errorf("arg[%d]: %w", i, err)
+		}
+		out = append(out, arg)
+	}
+	return out, nil
 }

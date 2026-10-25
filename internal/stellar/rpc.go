@@ -9,6 +9,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
 // This file is the only place SoroForge touches the Stellar RPC SDK. Everything
@@ -22,6 +23,7 @@ import (
 //   PollTransaction(ctx, txHash string)                           (protocol.GetTransactionResponse, error)
 //   GetLedgerEntries(ctx, protocol.GetLedgerEntriesRequest)       (protocol.GetLedgerEntriesResponse, error)
 //   GetLatestLedger(ctx)                                          (protocol.GetLatestLedgerResponse, error)
+//   GetNetwork(ctx)                                               (protocol.GetNetworkResponse, error)
 //   LoadAccount(ctx, address string)                              (txnbuild.Account, error)
 
 // DefaultHTTPTimeout bounds a single RPC call. Transaction confirmation is not
@@ -38,6 +40,7 @@ type RPCClient struct {
 // Compile-time check that the live implementation satisfies the interface every
 // other package depends on.
 var _ Client = (*RPCClient)(nil)
+var _ NetworkReporter = (*RPCClient)(nil)
 
 // RPCOptions configures a live client.
 type RPCOptions struct {
@@ -79,6 +82,15 @@ func (c *RPCClient) Close() error { return c.rpc.Close() }
 
 // NetworkPassphrase implements Client.
 func (c *RPCClient) NetworkPassphrase() string { return c.passphrase }
+
+// NetworkInfo implements Client.
+func (c *RPCClient) NetworkInfo(ctx context.Context) (string, error) {
+	info, err := c.rpc.GetNetwork(ctx)
+	if err != nil {
+		return "", fmt.Errorf("getNetwork: %w", err)
+	}
+	return info.Passphrase, nil
+}
 
 // LoadAccount implements Client.
 func (c *RPCClient) LoadAccount(ctx context.Context, address string) (txnbuild.Account, error) {
@@ -156,13 +168,27 @@ func (c *RPCClient) AwaitTransaction(ctx context.Context, hash string) (TxResult
 	if err != nil {
 		return TxResult{}, fmt.Errorf("getTransaction %s: %w", hash, err)
 	}
+	feeCharged := feeChargedFromResultXDR(resp.ResultXDR)
 	return TxResult{
 		Status:        resp.Status,
 		Hash:          resp.TransactionHash,
 		Ledger:        resp.Ledger,
 		ResultMetaXDR: resp.ResultMetaXDR,
 		ResultXDR:     resp.ResultXDR,
+		FeeCharged:    feeCharged,
 	}, nil
+}
+
+func feeChargedFromResultXDR(resultXDR string) *int64 {
+	if resultXDR == "" {
+		return nil
+	}
+	var result xdr.TransactionResult
+	if err := xdr.SafeUnmarshalBase64(resultXDR, &result); err != nil {
+		return nil
+	}
+	fee := int64(result.FeeCharged)
+	return &fee
 }
 
 // LedgerEntries implements Client.
@@ -181,6 +207,7 @@ func (c *RPCClient) LedgerEntries(ctx context.Context, keysB64 []string) ([]Ledg
 			KeyXDR:             e.KeyXDR,
 			DataXDR:            e.DataXDR,
 			LastModifiedLedger: e.LastModifiedLedger,
+			LiveUntilLedgerSeq: e.LiveUntilLedgerSeq,
 		})
 	}
 	return entries, nil
@@ -193,4 +220,15 @@ func (c *RPCClient) LatestLedger(ctx context.Context) (uint32, error) {
 		return 0, fmt.Errorf("getLatestLedger: %w", err)
 	}
 	return resp.Sequence, nil
+}
+
+// ReportNetworkPassphrase implements NetworkReporter. It asks the endpoint
+// which network it serves rather than echoing the configured value, so that
+// `soroforge networks` can compare the two.
+func (c *RPCClient) ReportNetworkPassphrase(ctx context.Context) (string, error) {
+	resp, err := c.rpc.GetNetwork(ctx)
+	if err != nil {
+		return "", fmt.Errorf("getNetwork: %w", err)
+	}
+	return resp.Passphrase, nil
 }

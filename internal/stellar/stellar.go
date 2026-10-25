@@ -29,6 +29,9 @@ type Client interface {
 	// passphrase fails locally instead of after a signed submission.
 	NetworkPassphrase() string
 
+	// NetworkInfo returns the passphrase reported by the RPC endpoint.
+	NetworkInfo(ctx context.Context) (string, error)
+
 	// LoadAccount fetches an account's current sequence number.
 	LoadAccount(ctx context.Context, address string) (txnbuild.Account, error)
 
@@ -49,6 +52,20 @@ type Client interface {
 	// LatestLedger returns the most recently closed ledger sequence. It doubles
 	// as a connectivity check for `soroforge status`.
 	LatestLedger(ctx context.Context) (uint32, error)
+}
+
+// NetworkReporter is implemented by clients whose endpoint can report which
+// Stellar network it actually serves. `soroforge networks` uses it to verify
+// that a configured network's passphrase matches what the endpoint answers,
+// so a misspelled rpc_url cannot silently point a deploy at the wrong chain.
+//
+// It is a separate interface rather than a method on Client because the
+// check is optional: an endpoint that does not implement getNetwork still
+// answers every operation Client requires.
+type NetworkReporter interface {
+	// ReportNetworkPassphrase returns the network passphrase the endpoint
+	// reports serving, via the RPC's getNetwork method.
+	ReportNetworkPassphrase(ctx context.Context) (string, error)
 }
 
 // Signer produces signatures for assembled transactions.
@@ -154,6 +171,9 @@ type TxResult struct {
 
 	// ResultXDR is a base64 TransactionResult.
 	ResultXDR string
+
+	// FeeCharged is the actual transaction fee from the confirmed result XDR.
+	FeeCharged *int64
 }
 
 // Transaction statuses returned by getTransaction.
@@ -175,4 +195,11 @@ type LedgerEntry struct {
 	DataXDR string
 
 	LastModifiedLedger uint32
+
+	// LiveUntilLedgerSeq is the ledger sequence until which the entry is
+	// live. Nil for entry types that have no TTL (accounts, most config
+	// settings). Since Protocol 23 the RPC reports archived entries — whose
+	// TTL has expired — rather than omitting them, using a placeholder value
+	// of 0.
+	LiveUntilLedgerSeq *uint32
 }

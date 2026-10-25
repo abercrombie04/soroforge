@@ -3,6 +3,7 @@ package deploy_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/soroworks/soroforge/internal/deploy"
 	"github.com/soroworks/soroforge/internal/stellar"
@@ -12,7 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const upgradedWasm = "\x00asm\x01\x00\x00\x00upgraded"
+// upgradedWasm differs from testWasm and is a structurally valid module with a
+// contractspecv0 custom section, so it gets past the pre-upload artifact checks.
+const upgradedWasm = "\x00asm\x01\x00\x00\x00\x00\x0f\x0econtractspecv0"
 
 // trackContract seeds the store as if a deploy had already happened, and points
 // the mocked ledger at the same hash.
@@ -216,4 +219,225 @@ func TestUpgradeSurfacesContractRejection(t *testing.T) {
 	_, err := h.svc.Upgrade(context.Background(), deploy.UpgradeRequest{Alias: "counter"})
 	assert.ErrorContains(t, err, "Unauthorized")
 	assert.ErrorContains(t, err, "invoke upgrade on")
+}
+
+func TestUpgradeToWasmHashSuccess(t *testing.T) {
+	// Upgrade directly to a known on-chain hash, without local WASM build.
+	h := newHarness(t, harnessOptions{})
+	currentHash := stellar.WasmHash([]byte(testWasm))
+	trackContract(t, h, currentHash)
+
+	targetHash := stellar.WasmHash([]byte(upgradedWasm))
+	targetHashHex := stellar.HashHex(targetHash)
+	require.NoError(t, h.client.SetWasmUploaded(targetHash))
+
+	ctx := context.Background()
+	result, err := h.svc.Upgrade(ctx, deploy.UpgradeRequest{
+		Alias:    "counter",
+		WasmHash: targetHashHex,
+		Notes:    "rollback to previous hash",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, h.contractID, result.ContractID)
+	assert.Equal(t, stellar.HashHex(currentHash), result.PreviousWasmHash)
+	assert.Equal(t, targetHashHex, result.WasmHash)
+	assert.True(t, result.UploadSkipped)
+	assert.Equal(t, 1, h.client.SendCount(), "only the upgrade invocation should be submitted")
+
+	history, err := h.store.History(ctx, "testnet", "counter")
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	assert.Equal(t, targetHashHex, history[0].WasmHash)
+	assert.Equal(t, "rollback to previous hash", history[0].Notes)
+}
+
+func TestUpgradeToWasmHashShortPrefix(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	currentHash := stellar.WasmHash([]byte("live-code"))
+	trackContract(t, h, currentHash)
+
+	targetHash := stellar.WasmHash([]byte("historical-code"))
+	targetHashHex := stellar.HashHex(targetHash)
+	require.NoError(t, h.client.SetWasmUploaded(targetHash))
+
+	// Seed targetHash in history
+	ctx := context.Background()
+	_, err := h.store.RecordDeployment(ctx, store.Deployment{
+		Alias:          "counter",
+		Network:        "testnet",
+		ContractID:     h.contractID,
+		WasmHash:       targetHashHex,
+		Action:         store.ActionDeploy,
+		DeployerPubkey: "GABC",
+		Actor:          "cli",
+	})
+	require.NoError(t, err)
+
+	prefix := targetHashHex[:12]
+	result, err := h.svc.Upgrade(ctx, deploy.UpgradeRequest{
+		Alias:    "counter",
+		WasmHash: prefix,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, targetHashHex, result.WasmHash)
+}
+
+func TestUpgradeToWasmHashAmbiguousPrefix(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	trackContract(t, h, stellar.WasmHash([]byte("live-code")))
+
+	ctx := context.Background()
+	_, err := h.store.RecordDeployment(ctx, store.Deployment{
+		Alias:          "counter",
+		Network:        "testnet",
+		ContractID:     h.contractID,
+		WasmHash:       "aaaa1111222233334444555566667777888899990000aaaabbbbccccddddeeee01",
+		Action:         store.ActionDeploy,
+		DeployerPubkey: "GABC",
+		Actor:          "cli",
+	})
+	require.NoError(t, err)
+	_, err = h.store.RecordDeployment(ctx, store.Deployment{
+		Alias:          "counter",
+		Network:        "testnet",
+		ContractID:     h.contractID,
+		WasmHash:       "aaaa1111222233334444555566667777888899990000aaaabbbbccccddddeeee02",
+		Action:         store.ActionUpgrade,
+		DeployerPubkey: "GABC",
+		Actor:          "cli",
+	})
+	require.NoError(t, err)
+
+	_, err = h.svc.Upgrade(ctx, deploy.UpgradeRequest{
+		Alias:    "counter",
+		WasmHash: "aaaa11",
+	})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "ambiguous wasm hash prefix")
+}
+
+func TestUpgradeToWasmHashUnknownPrefix(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	trackContract(t, h, stellar.WasmHash([]byte("live-code")))
+
+	ctx := context.Background()
+	_, err := h.svc.Upgrade(ctx, deploy.UpgradeRequest{
+		Alias:    "counter",
+		WasmHash: "bbbb",
+	})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "no wasm hash starting with \"bbbb\" found in history")
+}
+
+func TestUpgradeToWasmHashMissingOnChain(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	trackContract(t, h, stellar.WasmHash([]byte("live-code")))
+
+	missingHash := "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
+	_, err := h.svc.Upgrade(context.Background(), deploy.UpgradeRequest{
+		Alias:    "counter",
+		WasmHash: missingHash,
+	})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "does not exist on-chain")
+}
+
+func TestUpgradeFailsWhenEntrypointDoesNotChangeTheCode(t *testing.T) {
+	// The upgrade transaction confirms, but the contract's entrypoint returned
+	// success without calling update_current_contract_wasm — a bug, or an
+	// upgrade_fn pointing at a function that does something else. Recording
+	// the new hash would create an upgrade that never happened, and status
+	// would later report unexplainable drift.
+	h := newHarness(t, harnessOptions{
+		wasm:        upgradedWasm,
+		upgradeNoop: true,
+		verifyDelay: time.Millisecond,
+	})
+	oldHash := stellar.WasmHash([]byte(testWasm))
+	trackContract(t, h, oldHash)
+
+	ctx := context.Background()
+	_, err := h.svc.Upgrade(ctx, deploy.UpgradeRequest{Alias: "counter"})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "still running wasm")
+	assert.ErrorContains(t, err, "without updating the contract's code")
+	assert.ErrorContains(t, err, "nothing was recorded")
+
+	// Nothing moved in the database: the record still claims the old hash...
+	tracked, err := h.store.GetContract(ctx, "testnet", "counter")
+	require.NoError(t, err)
+	assert.Equal(t, stellar.HashHex(oldHash), tracked.CurrentWasmHash)
+
+	// ...and no history entry describes an upgrade that did not take effect.
+	history, err := h.store.History(ctx, "testnet", "counter")
+	require.NoError(t, err)
+	assert.Empty(t, history)
+}
+
+func TestUpgradeRetriesUntilTheNewHashIsVisible(t *testing.T) {
+	// A node can serve an entry from just before the upgrade transaction's
+	// ledger close, so the first read after confirmation may still report the
+	// old hash. The bounded retry exists to absorb exactly this.
+	h := newHarness(t, harnessOptions{
+		wasm:        upgradedWasm,
+		verifyDelay: time.Millisecond,
+	})
+	oldHash := stellar.WasmHash([]byte(testWasm))
+	trackContract(t, h, oldHash)
+
+	// Capture the stale entry the mock holds before the upgrade effect
+	// replaces it.
+	key, err := stellar.InstanceLedgerKey(h.contractID)
+	require.NoError(t, err)
+	encodedKey, err := xdr.MarshalBase64(key)
+	require.NoError(t, err)
+	staleEntry := h.client.Entries[encodedKey]
+	require.NotEmpty(t, staleEntry)
+
+	// Reads: 1 is the pre-upgrade hash, 2 checks whether the bytecode is
+	// uploaded, 3 is the first verification read. Answer 3 with the stale
+	// entry, and everything after it from the live map.
+	reads := 0
+	h.client.LedgerEntriesFunc = func(_ context.Context, keys []string) ([]stellar.LedgerEntry, error) {
+		reads++
+		var out []stellar.LedgerEntry
+		for _, k := range keys {
+			data, ok := h.client.Entries[k]
+			if reads == 3 && k == encodedKey {
+				data, ok = staleEntry, true
+			}
+			if ok {
+				out = append(out, stellar.LedgerEntry{KeyXDR: k, DataXDR: data, LastModifiedLedger: h.client.LedgerSeq})
+			}
+		}
+		return out, nil
+	}
+
+	result, err := h.svc.Upgrade(context.Background(), deploy.UpgradeRequest{Alias: "counter"})
+	require.NoError(t, err, "the retry must absorb one stale read")
+	assert.Equal(t, stellar.HashHex(h.wasmHash), result.WasmHash)
+
+	history, err := h.store.History(context.Background(), "testnet", "counter")
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	assert.Equal(t, stellar.HashHex(h.wasmHash), history[0].WasmHash)
+}
+
+func TestUpgradeRefusesStellarAssetContract(t *testing.T) {
+	h := newHarness(t, harnessOptions{configBody: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  xlm:
+    asset: native
+`})
+
+	_, err := h.svc.Upgrade(context.Background(), deploy.UpgradeRequest{Alias: "xlm"})
+	assert.ErrorContains(t, err, "cannot upgrade xlm")
+	assert.ErrorContains(t, err, "Stellar Asset Contracts cannot be upgraded")
 }

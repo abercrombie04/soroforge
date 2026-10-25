@@ -9,7 +9,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/soroworks/soroforge/internal/catalog"
 	"github.com/soroworks/soroforge/internal/deploy"
+	"github.com/soroworks/soroforge/internal/netcheck"
 	"github.com/soroworks/soroforge/internal/store"
 )
 
@@ -31,6 +33,9 @@ func printJSON(v any) error {
 // shortHash abbreviates a 64-character hash for table output. The full value is
 // always available with --json, so the table optimises for scanning.
 func shortHash(hash string) string {
+	if hash == "stellar_asset" {
+		return hash
+	}
 	const shown = 12
 	if len(hash) <= shown {
 		return hash
@@ -51,30 +56,56 @@ func printDeployResult(r *deploy.DeployResult) error {
 	}
 
 	fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+	if r.ContractURL != "" {
+		fmt.Fprintf(w, "  Explorer      %s\n", r.ContractURL)
+	}
 	fmt.Fprintf(w, "  WASM hash     %s\n", r.WasmHash)
 	fmt.Fprintf(w, "  Network       %s\n", r.Network)
 	fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
+	if r.ConstructorArgs != "" {
+		fmt.Fprintf(w, "  Constructor   %s\n", r.ConstructorArgs)
+	}
+	printWarnings(w, r.Warnings)
 
 	if r.UploadSkipped {
 		fmt.Fprintf(w, "  Upload        skipped (this bytecode is already on-chain)\n")
 	} else if r.UploadTxHash != "" {
 		fmt.Fprintf(w, "  Upload tx     %s\n", r.UploadTxHash)
+		if r.UploadTxURL != "" {
+			fmt.Fprintf(w, "  Upload URL    %s\n", r.UploadTxURL)
+		}
 	}
 	if r.CreateTxHash != "" {
 		fmt.Fprintf(w, "  Create tx     %s\n", r.CreateTxHash)
+		if r.CreateTxURL != "" {
+			fmt.Fprintf(w, "  Create URL    %s\n", r.CreateTxURL)
+		}
+	}
+	if r.InitTxHash != "" {
+		fmt.Fprintf(w, "  Init tx       %s\n", r.InitTxHash)
 	}
 	if r.Ledger != 0 {
 		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
 	}
+	if r.Deployment != nil && r.Deployment.CIRunURL != "" {
+		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
+	}
+	printExtension(w, r.Alias, r.Extension, r.ExtensionError)
 	printCatalog(w, r.Catalog)
+	printWebhooks(w, r.Webhooks)
 
 	if r.DryRun {
+		printEstimatedFees(w, r.EstimatedFees)
+
 		fmt.Fprintf(w, "\nAssembled transaction envelopes (unsigned):\n")
 		if r.UploadEnvelopeXDR != "" {
 			fmt.Fprintf(w, "\n  upload:\n  %s\n", r.UploadEnvelopeXDR)
 		}
 		if r.CreateEnvelopeXDR != "" {
 			fmt.Fprintf(w, "\n  create:\n  %s\n", r.CreateEnvelopeXDR)
+		}
+		if r.InitEnvelopeXDR != "" {
+			fmt.Fprintf(w, "\n  init:\n  %s\n", r.InitEnvelopeXDR)
 		}
 		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
 	}
@@ -93,6 +124,9 @@ func printUpgradeResult(r *deploy.UpgradeResult) error {
 		fmt.Fprintf(w, "%s on %s already runs this WASM hash — nothing to do.\n\n",
 			r.Alias, r.Network)
 		fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+		if r.ContractURL != "" {
+			fmt.Fprintf(w, "  Explorer      %s\n", r.ContractURL)
+		}
 		fmt.Fprintf(w, "  WASM hash     %s\n", r.WasmHash)
 		return nil
 	}
@@ -104,30 +138,132 @@ func printUpgradeResult(r *deploy.UpgradeResult) error {
 	}
 
 	fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+	if r.ContractURL != "" {
+		fmt.Fprintf(w, "  Explorer      %s\n", r.ContractURL)
+	}
 	fmt.Fprintf(w, "  From          %s\n", r.PreviousWasmHash)
 	fmt.Fprintf(w, "  To            %s\n", r.WasmHash)
 	fmt.Fprintf(w, "  Entrypoint    %s\n", r.UpgradeFunc)
 	fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
+	printWarnings(w, r.Warnings)
 
 	if r.UploadSkipped {
 		fmt.Fprintf(w, "  Upload        skipped (this bytecode is already on-chain)\n")
 	} else if r.UploadTxHash != "" {
 		fmt.Fprintf(w, "  Upload tx     %s\n", r.UploadTxHash)
+		if r.UploadTxURL != "" {
+			fmt.Fprintf(w, "  Upload URL    %s\n", r.UploadTxURL)
+		}
 	}
 	if r.UpgradeTxHash != "" {
 		fmt.Fprintf(w, "  Upgrade tx    %s\n", r.UpgradeTxHash)
+		if r.UpgradeTxURL != "" {
+			fmt.Fprintf(w, "  Upgrade URL   %s\n", r.UpgradeTxURL)
+		}
 	}
 	if r.Ledger != 0 {
 		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
 	}
+	if r.Deployment != nil && r.Deployment.CIRunURL != "" {
+		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
+	}
+	printExtension(w, r.Alias, r.Extension, r.ExtensionError)
 	printCatalog(w, r.Catalog)
+	printWebhooks(w, r.Webhooks)
 
-	if r.DryRun && r.UpgradeEnvelopeXDR != "" {
-		fmt.Fprintf(w, "\nAssembled upgrade envelope (unsigned):\n\n  %s\n", r.UpgradeEnvelopeXDR)
-		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
+	if r.DryRun {
+		printEstimatedFees(w, r.EstimatedFees)
+
+		if r.UpgradeEnvelopeXDR != "" {
+			fmt.Fprintf(w, "\nAssembled upgrade envelope (unsigned):\n\n  %s\n", r.UpgradeEnvelopeXDR)
+			fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
+		}
 	}
 
 	return nil
+}
+
+// printEstimatedFees renders a dry run's per-transaction and total cost. The
+// figures come from simulation, so they are labelled as estimates rather than
+// promises: the network can charge differently by the time a real deploy runs.
+func printEstimatedFees(w io.Writer, f *deploy.DryRunFees) {
+	if f == nil {
+		return
+	}
+
+	fmt.Fprintf(w, "\nEstimated fees (from simulation; the actual fee may differ):\n")
+	for _, row := range []struct {
+		label string
+		fee   *deploy.FeeEstimate
+	}{
+		{"upload", f.Upload},
+		{"create", f.Create},
+		{"upgrade", f.Upgrade},
+		{"init", f.Init},
+	} {
+		if row.fee == nil {
+			continue
+		}
+		fmt.Fprintf(w, "  %-8s %d stroops (%s XLM)\n", row.label, row.fee.TotalStroops, row.fee.TotalXLM)
+	}
+	fmt.Fprintf(w, "  %-8s %d stroops (%s XLM)\n", "total", f.Total.TotalStroops, f.Total.TotalXLM)
+}
+
+// stderrIsTerminal reports whether stderr is a character device. Only then is
+// in-place progress output safe; pipes, files, and CI logs are not.
+func stderrIsTerminal() bool {
+	info, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// progressFor returns a progress printer when progress should be shown: always
+// with --progress, and otherwise only when stderr is a terminal. It returns nil
+// when progress is off, which leaves the service silent.
+func progressFor(force bool) deploy.ProgressFunc {
+	interactive := stderrIsTerminal()
+	if !force && !interactive {
+		return nil
+	}
+	return progressPrinter(os.Stderr, interactive)
+}
+
+// progressPrinter renders deploy progress to w. On a terminal each event
+// rewrites a single line; elsewhere each event is its own line, which is what
+// a CI log wants.
+func progressPrinter(w io.Writer, interactive bool) deploy.ProgressFunc {
+	if !interactive {
+		return func(ev deploy.ProgressEvent) {
+			fmt.Fprintln(w, progressLine(ev))
+		}
+	}
+	return func(ev deploy.ProgressEvent) {
+		line := progressLine(ev)
+		if ev.Phase == deploy.ProgressConfirmed {
+			fmt.Fprintf(w, "\r\033[K%s\n", line)
+			return
+		}
+		fmt.Fprintf(w, "\r\033[K%s", line)
+	}
+}
+
+// progressLine renders one event as a single line of text.
+func progressLine(ev deploy.ProgressEvent) string {
+	prefix := fmt.Sprintf("%s on %s: %s", ev.Alias, ev.Network, ev.Step)
+	switch ev.Phase {
+	case deploy.ProgressSimulating:
+		return prefix + ": simulating…"
+	case deploy.ProgressSubmitted:
+		return fmt.Sprintf("%s: submitted (%s)", prefix, shortHash(ev.Hash))
+	case deploy.ProgressWaiting:
+		return fmt.Sprintf("%s: waiting for ledger %d…", prefix, ev.Ledger)
+	case deploy.ProgressConfirmed:
+		return fmt.Sprintf("%s: confirmed in ledger %d", prefix, ev.Ledger)
+	default:
+		return prefix + ": " + ev.Phase
+	}
 }
 
 func printUploadResult(r *deploy.UploadResult) error {
@@ -163,6 +299,9 @@ func printUploadResult(r *deploy.UploadResult) error {
 	if r.Ledger != 0 {
 		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
 	}
+	if r.Deployment != nil && r.Deployment.CIRunURL != "" {
+		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
+	}
 
 	if r.DryRun && r.UploadEnvelopeXDR != "" {
 		fmt.Fprintf(w, "\nAssembled upload envelope (unsigned):\n\n  %s\n", r.UploadEnvelopeXDR)
@@ -170,6 +309,209 @@ func printUploadResult(r *deploy.UploadResult) error {
 	}
 
 	return nil
+}
+
+func printInvokeResult(r *deploy.InvokeResult) error {
+	if flags.jsonOutput {
+		return printJSON(r)
+	}
+
+	w := out()
+
+	if r.DryRun {
+		fmt.Fprintf(w, "Dry run — nothing was submitted and nothing was recorded.\n\n")
+	} else {
+		fmt.Fprintf(w, "Invoked %s on %s (%s).\n\n", r.Function, r.Alias, r.Network)
+	}
+
+	fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+	fmt.Fprintf(w, "  Function      %s\n", r.Function)
+	if len(r.Args) > 0 {
+		fmt.Fprintf(w, "  Arguments     %s\n", strings.Join(r.Args, " "))
+	}
+	fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
+	if r.TxHash != "" {
+		fmt.Fprintf(w, "  Tx hash       %s\n", r.TxHash)
+	}
+	if r.Ledger != 0 {
+		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
+	}
+	if r.Deployment != nil && r.Deployment.CIRunURL != "" {
+		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
+	}
+
+	if r.DryRun && r.EnvelopeXDR != "" {
+		fmt.Fprintf(w, "\nAssembled invocation envelope (unsigned):\n\n  %s\n", r.EnvelopeXDR)
+		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
+	}
+
+	return nil
+}
+
+func printExtendResult(r *deploy.ExtendResult) error {
+	if flags.jsonOutput {
+		return printJSON(r)
+	}
+
+	w := out()
+	if r.DryRun {
+		fmt.Fprintf(w, "Dry run — nothing was submitted and nothing was recorded.\n\n")
+	} else {
+		fmt.Fprintf(w, "Extended %s's TTLs on %s.\n\n", r.Alias, r.Network)
+	}
+
+	fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+	fmt.Fprintf(w, "  WASM hash     %s\n", r.WasmHash)
+	fmt.Fprintf(w, "  Entries       %s\n", strings.Join(r.Entries, ", "))
+	fmt.Fprintf(w, "  Extended      %d ledgers (%s)\n", r.ExtendedLedgers, describeLedgers(r.ExtendedLedgers))
+	if r.Capped {
+		fmt.Fprintf(w, "                capped from %d at the network's maximum of %d\n",
+			r.RequestedLedgers, r.MaxEntryTTL-1)
+	}
+	fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
+	if r.MinResourceFee != 0 {
+		fmt.Fprintf(w, "  Resource fee  %d stroops\n", r.MinResourceFee)
+	}
+	if r.TxHash != "" {
+		fmt.Fprintf(w, "  Extend tx     %s\n", r.TxHash)
+	}
+	if r.Ledger != 0 {
+		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
+	}
+
+	if r.DryRun && r.EnvelopeXDR != "" {
+		fmt.Fprintf(w, "\nAssembled extend envelope (unsigned):\n\n  %s\n", r.EnvelopeXDR)
+		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
+	}
+
+	return nil
+}
+
+func printRestoreResult(r *deploy.RestoreResult) error {
+	if flags.jsonOutput {
+		return printJSON(r)
+	}
+
+	w := out()
+	if r.NothingToRestore {
+		fmt.Fprintf(w, "Nothing to restore — %s's entries are already live on %s.\n\n", r.Alias, r.Network)
+		printRestoreFields(w, r)
+		return nil
+	}
+
+	if r.DryRun {
+		fmt.Fprintf(w, "Dry run — nothing was submitted and nothing was recorded.\n\n")
+	} else {
+		fmt.Fprintf(w, "Restored %s on %s.\n\n", r.Alias, r.Network)
+	}
+
+	printRestoreFields(w, r)
+
+	if r.DryRun && r.EnvelopeXDR != "" {
+		fmt.Fprintf(w, "\nAssembled restore envelope (unsigned):\n\n  %s\n", r.EnvelopeXDR)
+		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
+	}
+
+	return nil
+}
+
+func printRestoreFields(w io.Writer, r *deploy.RestoreResult) {
+	fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+	fmt.Fprintf(w, "  WASM hash     %s\n", r.WasmHash)
+	if len(r.Entries) > 0 {
+		fmt.Fprintf(w, "  Entries       %s\n", strings.Join(r.Entries, ", "))
+	}
+	fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
+	if r.MinResourceFee != 0 {
+		fmt.Fprintf(w, "  Resource fee  %d stroops\n", r.MinResourceFee)
+	}
+	if r.TxHash != "" {
+		fmt.Fprintf(w, "  Restore tx    %s\n", r.TxHash)
+	}
+	if r.Ledger != 0 {
+		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
+	}
+}
+
+func printFundResult(r *deploy.FundResult) error {
+	if flags.jsonOutput {
+		return printJSON(r)
+	}
+
+	w := out()
+	if r.AlreadyFunded {
+		fmt.Fprintf(w, "%s already has its starting balance on %s; nothing to do.\n\n",
+			r.Address, r.Network)
+	} else {
+		fmt.Fprintf(w, "Funded %s on %s.\n\n", r.Address, r.Network)
+	}
+
+	fmt.Fprintf(w, "  Address       %s\n", r.Address)
+	fmt.Fprintf(w, "  Network       %s\n", r.Network)
+	fmt.Fprintf(w, "  Friendbot     %s\n", r.FriendbotURL)
+	if r.Hash != "" {
+		fmt.Fprintf(w, "  Funding tx    %s\n", r.Hash)
+	}
+	return nil
+}
+
+func printWhoAmIResult(r *deploy.WhoAmIResult) error {
+	if flags.jsonOutput {
+		return printJSON(r)
+	}
+
+	w := out()
+	fmt.Fprintf(w, "%s\n\n", r.Detail)
+
+	fmt.Fprintf(w, "  Address       %s\n", r.Address)
+	if r.KeySource != "" {
+		fmt.Fprintf(w, "  Key source    %s\n", r.KeySource)
+	}
+	fmt.Fprintf(w, "  Network       %s\n", r.Network)
+	if r.Funded {
+		fmt.Fprintf(w, "  Balance       %s XLM\n", r.BalanceXLM)
+		fmt.Fprintf(w, "  Sequence      %d\n", r.Sequence)
+	} else {
+		fmt.Fprintf(w, "  Funded        no (the account has no ledger entry yet)\n")
+		if r.FriendbotURL != "" {
+			fmt.Fprintf(w, "  Friendbot     %s\n", r.FriendbotURL)
+		}
+	}
+	return nil
+}
+
+func printExtension(w io.Writer, alias string, ext *deploy.ExtendResult, extErr string) {
+	switch {
+	case extErr != "":
+		fmt.Fprintf(w, "  TTL           not extended: %s\n", extErr)
+		fmt.Fprintf(w, "                (the contract is live; run `soroforge extend %s` to retry)\n", alias)
+	case ext != nil:
+		fmt.Fprintf(w, "  TTL           extended %d ledgers (tx %s)\n",
+			ext.ExtendedLedgers, shortHash(ext.TxHash))
+	}
+}
+
+func describeLedgers(ledgers uint32) string {
+	seconds := int64(ledgers) * 5
+	switch {
+	case seconds >= 48*3600:
+		return fmt.Sprintf("about %.0f days", float64(seconds)/(24*3600))
+	case seconds >= 2*3600:
+		return fmt.Sprintf("about %.0f hours", float64(seconds)/3600)
+	case seconds >= 120:
+		return fmt.Sprintf("about %.0f minutes", float64(seconds)/60)
+	default:
+		return fmt.Sprintf("about %d seconds", seconds)
+	}
+}
+
+// printWarnings reports non-fatal artifact problems found before upload. They
+// go to stdout with the result because they are part of it; --json carries the
+// same text in the result's warnings field.
+func printWarnings(w io.Writer, warnings []string) {
+	for _, warning := range warnings {
+		fmt.Fprintf(w, "  Warning       %s\n", warning)
+	}
 }
 
 // printCatalog reports SoroVault registration. A failure is shown as a
@@ -184,6 +526,70 @@ func printCatalog(w io.Writer, c *deploy.CatalogStatus) {
 		return
 	}
 	fmt.Fprintf(w, "  SoroVault     %s (%d functions)\n", c.Entry.URL, c.Entry.Functions)
+}
+
+// printDeployAll reports one batch deploy. It always prints every result —
+// including a failure — because the summary is how the caller learns what
+// succeeded before the run stopped.
+func printDeployAll(results []deploy.DeployAllResult) error {
+	if flags.jsonOutput {
+		return printJSON(results)
+	}
+
+	w := out()
+	if len(results) == 0 {
+		fmt.Fprintln(w, "No contracts were deployed.")
+		return nil
+	}
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ALIAS\tSTATUS\tCONTRACT ID\tWASM HASH\tDETAIL")
+	for _, r := range results {
+		contractID, wasmHash, detail := "-", "-", ""
+		if r.Result != nil {
+			contractID = r.Result.ContractID
+			wasmHash = shortHash(r.Result.WasmHash)
+			if r.Result.DryRun {
+				detail = "nothing submitted"
+			} else if r.Result.UploadSkipped {
+				detail = "upload skipped"
+			}
+		}
+		switch r.Status {
+		case deploy.DeployAllSkipped:
+			detail = "already tracked"
+		case deploy.DeployAllFailed:
+			detail = r.Error
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", r.Alias, r.Status, contractID, wasmHash, detail)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	counts := map[string]int{}
+	for _, r := range results {
+		counts[r.Status]++
+	}
+	fmt.Fprintf(w, "\n%d deployed, %d simulated, %d skipped, %d failed.\n",
+		counts[deploy.DeployAllDeployed],
+		counts[deploy.DeployAllDryRun],
+		counts[deploy.DeployAllSkipped],
+		counts[deploy.DeployAllFailed])
+	if last := results[len(results)-1]; last.Status == deploy.DeployAllFailed {
+		fmt.Fprintf(w, "Stopped at %s; nothing after it was attempted.\n", last.Alias)
+	}
+	return nil
+}
+
+func printWebhooks(w io.Writer, webhooks []deploy.WebhookStatus) {
+	for _, wh := range webhooks {
+		if !wh.OK {
+			fmt.Fprintf(w, "  Webhook       failed (%s): %s\n", wh.URL, wh.Error)
+		} else {
+			fmt.Fprintf(w, "  Webhook       delivered to %s\n", wh.URL)
+		}
+	}
 }
 
 func printContracts(contracts []store.Contract) error {
@@ -221,18 +627,104 @@ func printHistory(alias, network string, deployments []store.Deployment) error {
 
 	fmt.Fprintf(out(), "History for %s on %s (newest first):\n\n", alias, network)
 
-	tw := tabwriter.NewWriter(out(), 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "WHEN\tACTION\tWASM HASH\tDEPLOYER\tLEDGER\tTX\tNOTES")
+	hasExplorerLinks := false
 	for _, d := range deployments {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		if d.ContractURL != "" || d.TxURL != "" {
+			hasExplorerLinks = true
+			break
+		}
+	}
+	tw := tabwriter.NewWriter(out(), 0, 0, 2, ' ', 0)
+	header := "WHEN\tACTION\tACTOR\tWASM HASH\tDEPLOYER\tLEDGER\tFEE (STROOPS)\tFEE (XLM)\tCOMMIT\tTX\tCI RUN"
+	if hasExplorerLinks {
+		header += "\tCONTRACT URL\tTX URL"
+	}
+	fmt.Fprintln(tw, header+"\tNOTES")
+	for _, d := range deployments {
+		feeStroops, feeXLM := "-", "-"
+		if d.FeeCharged != nil {
+			feeStroops = fmt.Sprintf("%d", *d.FeeCharged)
+			feeXLM = fmt.Sprintf("%d.%07d", *d.FeeCharged/10_000_000, *d.FeeCharged%10_000_000)
+		}
+		commit := "-"
+		if d.GitCommit != "" {
+			commit = shortHash(d.GitCommit)
+			if d.Dirty {
+				commit += "*"
+			}
+		}
+		ciRun := "-"
+		if d.CIRunURL != "" {
+			ciRun = d.CIRunURL
+		}
+		actor := d.Actor
+		if actor == "" {
+			actor = "cli"
+		}
+		notes := d.Notes
+		if d.Action == store.ActionInvoke && d.FnName != "" {
+			inv := d.FnName
+			if d.FnArgs != "" {
+				inv += "(" + d.FnArgs + ")"
+			} else {
+				inv += "()"
+			}
+			if notes != "" {
+				notes = inv + " - " + notes
+			} else {
+				notes = inv
+			}
+		}
+		cols := []string{
 			formatTime(d.CreatedAt),
-			d.Action,
+			string(d.Action),
+			actor,
 			shortHash(d.WasmHash),
 			shortHash(d.DeployerPubkey),
 			formatLedger(d.Ledger),
+			feeStroops,
+			feeXLM,
+			commit,
 			shortHash(d.TxHash),
-			truncate(d.Notes, 40),
-		)
+			ciRun,
+		}
+		if hasExplorerLinks {
+			cols = append(cols, d.ContractURL, d.TxURL)
+		}
+		cols = append(cols, truncate(notes, 40))
+		fmt.Fprintln(tw, strings.Join(cols, "\t"))
+	}
+	return tw.Flush()
+}
+
+// printFailures renders one contract's failed deploy and upgrade attempts —
+// the rows behind `soroforge history --failures`. Error text arrives already
+// redacted of key material by the store (see store.SanitizeKeyMaterial), so
+// printing it is safe.
+func printFailures(alias, network string, attempts []store.Attempt) error {
+	if flags.jsonOutput {
+		return printJSON(map[string]any{
+			"alias":    alias,
+			"network":  network,
+			"failures": attempts,
+		})
+	}
+
+	if len(attempts) == 0 {
+		fmt.Fprintf(out(), "No failed attempts for %s on %s.\n", alias, network)
+		return nil
+	}
+
+	fmt.Fprintf(out(), "Failed attempts for %s on %s (newest first):\n\n", alias, network)
+	tw := tabwriter.NewWriter(out(), 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "WHEN\tACTION\tSTAGE\tTX\tERROR")
+	for _, a := range attempts {
+		tx := "-"
+		if a.TxHash != "" {
+			tx = shortHash(a.TxHash)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+			formatTime(a.CreatedAt), string(a.Action), string(a.Stage), tx, truncate(a.Error, 80))
 	}
 	return tw.Flush()
 }
@@ -258,6 +750,49 @@ func printStatus(r *deploy.StatusResult) error {
 		fmt.Fprintf(w, "  On-chain      %s\n", r.ActualWasmHash)
 	}
 
+	return nil
+}
+
+// diffMarks are the line prefixes for each kind of interface change.
+var diffMarks = map[catalog.ChangeKind]string{
+	catalog.Added:   "+",
+	catalog.Removed: "-",
+	catalog.Changed: "~",
+}
+
+func printDiff(r *deploy.DiffResult) error {
+	if flags.jsonOutput {
+		return printJSON(r)
+	}
+
+	w := out()
+	fmt.Fprintf(w, "%s on %s: %s  →  %s\n\n", r.Alias, r.Network, shortHash(r.From), shortHash(r.To))
+	if len(r.Changes) == 0 {
+		fmt.Fprintln(w, "No interface changes.")
+		return nil
+	}
+
+	tw := tabwriter.NewWriter(w, 0, 0, 4, ' ', 0)
+	for _, c := range r.Changes {
+		line := diffMarks[c.Kind] + " " + c.Signature
+		if c.Kind == catalog.Removed && c.Item != "fn" {
+			line = diffMarks[c.Kind] + " " + c.Item + " " + c.Name
+		}
+		note := ""
+		if c.Previous != "" {
+			note = "(was: " + c.Previous + ")"
+		}
+		if c.Breaking {
+			note = strings.TrimSpace(note + " [breaking]")
+		}
+		fmt.Fprintf(tw, "%s\t%s\n", line, note)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if r.Breaking {
+		fmt.Fprintln(w, "\nThis upgrade has breaking changes.")
+	}
 	return nil
 }
 
@@ -290,6 +825,84 @@ func printNetworkStatus(r *deploy.NetworkStatus) error {
 	}
 	fmt.Fprintf(w, "\n%d of %d contract(s) on %s in sync.\n", synced, len(r.Contracts), r.Network)
 	return nil
+}
+
+// printNetworkResults renders the `soroforge networks` report. The RPC URL is
+// always the redacted one from the probe result — the raw URL can carry
+// provider credentials in userinfo or the query string, and nothing here may
+// leak them, including in the --json payload a user is encouraged to paste.
+func printNetworkResults(results []netcheck.Result) error {
+	if flags.jsonOutput {
+		return printJSON(map[string]any{
+			"networks": results,
+			"all_ok":   !netcheck.AnyFailure(results),
+		})
+	}
+
+	w := out()
+	if len(results) == 0 {
+		fmt.Fprintln(w, "No networks are configured.")
+		return nil
+	}
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NETWORK\tRESPONDED\tLATENCY\tLATEST LEDGER\tPASSPHRASE\tRPC")
+	for _, r := range results {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			r.Network,
+			yesNo(r.Responded),
+			formatLatency(r.Latency),
+			formatLedger(r.LatestLedger),
+			passphraseVerdict(r),
+			r.RedactedURL,
+		)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	for _, r := range results {
+		if !r.OK {
+			fmt.Fprintf(w, "\n%s: %s\n", r.Network, r.Error)
+		}
+	}
+
+	healthy := 0
+	for _, r := range results {
+		if r.OK {
+			healthy++
+		}
+	}
+	fmt.Fprintf(w, "\n%d of %d network(s) healthy.\n", healthy, len(results))
+	return nil
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+// passphraseVerdict distinguishes "the endpoint confirmed the network" from
+// "the endpoint never answered getNetwork": an unverified passphrase is not a
+// mismatch, it is unknown, and the report must not imply otherwise.
+func passphraseVerdict(r netcheck.Result) string {
+	switch {
+	case !r.PassphraseVerified:
+		return "not verified"
+	case r.PassphraseMatch:
+		return "match"
+	default:
+		return "MISMATCH"
+	}
+}
+
+func formatLatency(d time.Duration) string {
+	if d <= 0 {
+		return "-"
+	}
+	return d.Round(time.Millisecond).String()
 }
 
 func formatTime(t time.Time) string {

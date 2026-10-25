@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -93,6 +95,26 @@ var scalarArgCases = map[string]struct {
 		yaml:     "{type: u32, value: 7}",
 		wantType: xdr.ScValTypeScvU32,
 		check:    func(t *testing.T, v xdr.ScVal) { assert.Equal(t, xdr.Uint32(7), *v.U32) },
+	},
+	"timepoint": {
+		yaml:     "{type: timepoint, value: 1700000000}",
+		wantType: xdr.ScValTypeScvTimepoint,
+		check:    func(t *testing.T, v xdr.ScVal) { assert.Equal(t, xdr.TimePoint(1700000000), *v.Timepoint) },
+	},
+	"timepoint max": {
+		yaml:     `{type: timepoint, value: "18446744073709551615"}`,
+		wantType: xdr.ScValTypeScvTimepoint,
+		check:    func(t *testing.T, v xdr.ScVal) { assert.Equal(t, xdr.TimePoint(18446744073709551615), *v.Timepoint) },
+	},
+	"duration": {
+		yaml:     "{type: duration, value: 3600}",
+		wantType: xdr.ScValTypeScvDuration,
+		check:    func(t *testing.T, v xdr.ScVal) { assert.Equal(t, xdr.Duration(3600), *v.Duration) },
+	},
+	"duration max": {
+		yaml:     `{type: duration, value: "18446744073709551615"}`,
+		wantType: xdr.ScValTypeScvDuration,
+		check:    func(t *testing.T, v xdr.ScVal) { assert.Equal(t, xdr.Duration(18446744073709551615), *v.Duration) },
 	},
 }
 
@@ -325,7 +347,7 @@ var badInputArgCases = map[string]struct {
 		wantErr: "missing type",
 	},
 	"unknown type names the escape hatch": {
-		arg:     Arg{Type: "u256", Value: NewValue("1")},
+		arg:     Arg{Type: "u512", Value: NewValue("1")},
 		wantErr: "type: xdr",
 	},
 	"u32 overflow": {
@@ -372,6 +394,10 @@ var badInputArgCases = map[string]struct {
 		arg:     Arg{Type: ArgXDR, Value: NewValue("!!!!")},
 		wantErr: "not a valid base64 ScVal",
 	},
+	"contract reference not resolved at deploy time": {
+		arg:     Arg{Type: ArgContract, ContractRef: "token"},
+		wantErr: "contract reference must be resolved at deploy time",
+	},
 	"missing value": {
 		arg:     Arg{Type: ArgU32},
 		wantErr: "missing value",
@@ -379,6 +405,42 @@ var badInputArgCases = map[string]struct {
 	"scalar expected but list given": {
 		arg:     Arg{Type: ArgU32, Value: NewValue([]int{1, 2})},
 		wantErr: "expected a single value",
+	},
+	"u256 out of range": {
+		arg:     Arg{Type: ArgU256, Value: NewValue("115792089237316195423570985008687907853269984665640564039457584007913129639936")},
+		wantErr: "out of range",
+	},
+	"u256 negative": {
+		arg:     Arg{Type: ArgU256, Value: NewValue("-1")},
+		wantErr: "out of range",
+	},
+	"i256 not a number": {
+		arg:     Arg{Type: ArgI256, Value: NewValue("abc")},
+		wantErr: "not a valid decimal integer",
+	},
+	"i256 out of range positive": {
+		arg:     Arg{Type: ArgI256, Value: NewValue("57896044618658097711785492504343953926634992332820282019728792003956564819968")},
+		wantErr: "out of range",
+	},
+	"i256 out of range negative": {
+		arg:     Arg{Type: ArgI256, Value: NewValue("-57896044618658097711785492504343953926634992332820282019728792003956564819969")},
+		wantErr: "out of range",
+	},
+	"timepoint negative": {
+		arg:     Arg{Type: ArgTimepoint, Value: NewValue("-1")},
+		wantErr: "not a valid u64",
+	},
+	"timepoint overflow": {
+		arg:     Arg{Type: ArgTimepoint, Value: NewValue("18446744073709551616")},
+		wantErr: "not a valid u64",
+	},
+	"duration negative": {
+		arg:     Arg{Type: ArgDuration, Value: NewValue("-1")},
+		wantErr: "not a valid u64",
+	},
+	"duration overflow": {
+		arg:     Arg{Type: ArgDuration, Value: NewValue("18446744073709551616")},
+		wantErr: "not a valid u64",
 	},
 }
 
@@ -438,6 +500,251 @@ func TestArgsToScValsEmpty(t *testing.T) {
 	assert.Empty(t, vals)
 }
 
+func TestParseArgFlag(t *testing.T) {
+	tests := map[string]struct {
+		flag     string
+		wantType xdr.ScValType
+		check    func(t *testing.T, v xdr.ScVal)
+	}{
+		"u32": {
+			flag:     "u32:7",
+			wantType: xdr.ScValTypeScvU32,
+			check:    func(t *testing.T, v xdr.ScVal) { assert.Equal(t, xdr.Uint32(7), *v.U32) },
+		},
+		"string with spaces": {
+			flag:     "string:Example Token",
+			wantType: xdr.ScValTypeScvString,
+			check:    func(t *testing.T, v xdr.ScVal) { assert.Equal(t, xdr.ScString("Example Token"), *v.Str) },
+		},
+		"value containing a colon": {
+			// The first colon splits type from value, so URLs and timestamps
+			// survive.
+			flag:     "string:https://example.org",
+			wantType: xdr.ScValTypeScvString,
+			check:    func(t *testing.T, v xdr.ScVal) { assert.Equal(t, xdr.ScString("https://example.org"), *v.Str) },
+		},
+		"void without a value": {
+			flag:     "void",
+			wantType: xdr.ScValTypeScvVoid,
+		},
+		"bool": {
+			flag:     "bool:true",
+			wantType: xdr.ScValTypeScvBool,
+			check:    func(t *testing.T, v xdr.ScVal) { assert.True(t, *v.B) },
+		},
+		"large integer beyond float precision": {
+			// The shell passes the digits; SoroForge reads them as text, so no
+			// precision is lost on the way in.
+			flag:     `u128:170141183460469231731687303715884105727`,
+			wantType: xdr.ScValTypeScvU128,
+		},
+		"xdr escape hatch": {
+			flag:     "xdr:AAAAAQ==", // base64 ScVal: SCV_VOID
+			wantType: xdr.ScValTypeScvVoid,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			arg, err := ParseArgFlag(tc.flag)
+			require.NoError(t, err)
+
+			val, err := arg.ToScVal()
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantType, val.Type)
+			if tc.check != nil {
+				tc.check(t, val)
+			}
+		})
+	}
+}
+
+func TestParseArgFlagRejectsBadInput(t *testing.T) {
+	tests := map[string]struct {
+		flag    string
+		wantErr string
+	}{
+		"missing type": {
+			flag:    ":7",
+			wantErr: "missing type",
+		},
+		"missing value": {
+			flag:    "u32",
+			wantErr: "missing value",
+		},
+		"unknown type": {
+			flag:    "f64:1",
+			wantErr: "unsupported type",
+		},
+		"invalid value": {
+			flag:    "u32:not a number",
+			wantErr: "not a valid u32",
+		},
+		"nested vec needs the file form": {
+			flag:    "vec:[1]",
+			wantErr: "vec: expected a list of args",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseArgFlag(tc.flag)
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestParseArgsJSONSupportsNestedForms(t *testing.T) {
+	// The JSON file form is where nested vec and map arguments are used, so it
+	// must accept exactly the shapes soroforge.yaml accepts.
+	args, err := ParseArgsJSON([]byte(`[
+		{"type": "u32", "value": 7},
+		{"type": "string", "value": "SoroForge"},
+		{"type": "vec", "value": [{"type": "bool", "value": true}]},
+		{"type": "map", "value": [
+			{"key": {"type": "symbol", "value": "decimals"},
+			 "value": {"type": "u32", "value": 7}}
+		]}
+	]`))
+	require.NoError(t, err)
+	require.Len(t, args, 4)
+
+	vals, err := ArgsToScVals(args)
+	require.NoError(t, err)
+
+	assert.Equal(t, xdr.Uint32(7), *vals[0].U32)
+	assert.Equal(t, xdr.ScString("SoroForge"), *vals[1].Str)
+
+	require.Equal(t, xdr.ScValTypeScvVec, vals[2].Type)
+	require.NotNil(t, vals[2].Vec)
+	items := **vals[2].Vec
+	require.Len(t, items, 1)
+	assert.True(t, *items[0].B)
+
+	require.Equal(t, xdr.ScValTypeScvMap, vals[3].Type)
+	require.NotNil(t, vals[3].Map)
+	entries := **vals[3].Map
+	require.Len(t, entries, 1)
+	assert.Equal(t, xdr.ScSymbol("decimals"), *entries[0].Key.Sym)
+	assert.Equal(t, xdr.Uint32(7), *entries[0].Val.U32)
+}
+
+func TestParseArgsJSONKeepsLargeIntegersExact(t *testing.T) {
+	// JSON numbers beyond float64's exact range would be rounded before
+	// ToScVal ever saw them if they were decoded as floats.
+	args, err := ParseArgsJSON([]byte(`[{"type": "u64", "value": 18446744073709551615}]`))
+	require.NoError(t, err)
+
+	val, err := args[0].ToScVal()
+	require.NoError(t, err)
+	assert.Equal(t, xdr.Uint64(18446744073709551615), *val.U64)
+}
+
+func TestParseArgsJSONRejectsBadInput(t *testing.T) {
+	tests := map[string]struct {
+		raw     string
+		wantErr string
+	}{
+		"not an array": {
+			raw:     `{"type": "u32", "value": 1}`,
+			wantErr: "cannot unmarshal object",
+		},
+		"malformed json": {
+			raw:     `[`,
+			wantErr: "unexpected EOF",
+		},
+		"unknown field": {
+			raw:     `[{"type": "u32", "value": 1, "typo": true}]`,
+			wantErr: "unknown field",
+		},
+		"invalid value": {
+			raw:     `[{"type": "u32", "value": "not a number"}]`,
+			wantErr: "arg[0]",
+		},
+		"trailing data": {
+			raw:     `[] []`,
+			wantErr: "trailing data",
+		},
+		"empty input": {
+			raw:     ``,
+			wantErr: "EOF",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseArgsJSON([]byte(tc.raw))
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestParseArgsFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "args.json")
+	require.NoError(t, os.WriteFile(path, []byte(`[{"type": "u32", "value": 7}]`), 0o600))
+
+	args, err := ParseArgsFile(path)
+	require.NoError(t, err)
+	require.Len(t, args, 1)
+	val, err := args[0].ToScVal()
+	require.NoError(t, err)
+	assert.Equal(t, xdr.Uint32(7), *val.U32)
+}
+
+func TestParseArgsFileReportsBadPath(t *testing.T) {
+	_, err := ParseArgsFile(filepath.Join(t.TempDir(), "absent.json"))
+	assert.ErrorContains(t, err, "read args file")
+}
+
+func TestArgsToJSONRoundTrips(t *testing.T) {
+	// What gets recorded with a deployment must parse back into the same
+	// values, including nested forms.
+	original := []Arg{
+		{Type: ArgU32, Value: NewValue("7")},
+		{Type: ArgVec, Value: NewValue([]any{
+			map[string]any{"type": "bool", "value": true},
+		})},
+	}
+	encoded, err := ArgsToJSON(original)
+	require.NoError(t, err)
+	assert.Contains(t, encoded, `"type":"u32"`)
+
+	decoded, err := ParseArgsJSON([]byte(encoded))
+	require.NoError(t, err)
+
+	want, err := ArgsToScVals(original)
+	require.NoError(t, err)
+	got, err := ArgsToScVals(decoded)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+}
+
+func TestArgsToJSONKeepsArgsFileNumbersNumeric(t *testing.T) {
+	// Recording is what lets a deploy be reproduced later, so an argument
+	// written as a JSON number in an --args-file must be recorded as a number,
+	// exactly as the same value passed with --arg would be.
+	args, err := ParseArgsJSON([]byte(`[
+		{"type": "u32", "value": 9},
+		{"type": "vec", "value": [{"type": "u64", "value": 18446744073709551615}]}
+	]`))
+	require.NoError(t, err)
+
+	encoded, err := ArgsToJSON(args)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[
+		{"type": "u32", "value": 9},
+		{"type": "vec", "value": [{"type": "u64", "value": 18446744073709551615}]}
+	]`, encoded)
+	assert.Contains(t, encoded, `"value":18446744073709551615`,
+		"a u64 beyond float64's exact range must be recorded exactly")
+}
+
+func TestArgsToJSONEmpty(t *testing.T) {
+	encoded, err := ArgsToJSON(nil)
+	require.NoError(t, err)
+	assert.Empty(t, encoded)
+}
+
 func TestParseSalt(t *testing.T) {
 	t.Run("valid 32 bytes", func(t *testing.T) {
 		salt, err := ParseSalt("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
@@ -465,4 +772,155 @@ func TestParseSalt(t *testing.T) {
 func uint32Ptr(v uint32) *xdr.Uint32 {
 	x := xdr.Uint32(v)
 	return &x
+}
+
+func TestParseCLIArg(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantTyp string
+	}{
+		{"u32:7", ArgU32},
+		{"i32:-10", ArgI32},
+		{"u64:100", ArgU64},
+		{"i64:-100", ArgI64},
+		{"u128:1000", ArgU128},
+		{"i128:-1000", ArgI128},
+		{"bool:true", ArgBool},
+		{"bool:false", ArgBool},
+		{"string:hello", ArgString},
+		{"string:\"hello world\"", ArgString},
+		{"symbol:transfer", ArgSymbol},
+		{"bytes:deadbeef", ArgBytes},
+		{"address:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", ArgAddress},
+		{"void", ArgVoid},
+		{"{type: u32, value: 42}", ArgU32},
+		{"{type: vec, value: [{type: u32, value: 1}, {type: u32, value: 2}]}", ArgVec},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			arg, err := ParseCLIArg(tc.input)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantTyp, arg.Type)
+			_, err = arg.ToScVal()
+			require.NoError(t, err)
+		})
+	}
+
+	t.Run("invalid arguments", func(t *testing.T) {
+		_, err := ParseCLIArg("")
+		assert.Error(t, err)
+
+		_, err = ParseCLIArg("u32:not_a_number")
+		assert.Error(t, err)
+
+		_, err = ParseCLIArg("invalidformat")
+		assert.Error(t, err)
+	})
+}
+
+func TestParseCLIArgs(t *testing.T) {
+	args, err := ParseCLIArgs([]string{"u32:7", "string:test", "void"})
+	require.NoError(t, err)
+	require.Len(t, args, 3)
+	assert.Equal(t, ArgU32, args[0].Type)
+	assert.Equal(t, ArgString, args[1].Type)
+	assert.Equal(t, ArgVoid, args[2].Type)
+
+	_, err = ParseCLIArgs([]string{"u32:7", "bad"})
+	assert.ErrorContains(t, err, "arg[1]")
+}
+
+func TestArgToScVal256BitIntegers(t *testing.T) {
+	tests := map[string]struct {
+		yaml     string
+		wantHiHi any
+		wantHiLo xdr.Uint64
+		wantLoHi xdr.Uint64
+		wantLoLo xdr.Uint64
+	}{
+		"u256 zero": {
+			yaml:     `{type: u256, value: "0"}`,
+			wantHiHi: xdr.Uint64(0), wantHiLo: 0, wantLoHi: 0, wantLoLo: 0,
+		},
+		"u256 low word only": {
+			yaml:     `{type: u256, value: "18446744073709551615"}`,
+			wantHiHi: xdr.Uint64(0), wantHiLo: 0, wantLoHi: 0, wantLoLo: 18446744073709551615,
+		},
+		"u256 spans multiple words": {
+			yaml:     `{type: u256, value: "340282366920938463463374607431768211456"}`, // 2^128
+			wantHiHi: xdr.Uint64(0), wantHiLo: 1, wantLoHi: 0, wantLoLo: 0,
+		},
+		"u256 maximum": {
+			// 2^256 - 1
+			yaml:     `{type: u256, value: "115792089237316195423570985008687907853269984665640564039457584007913129639935"}`,
+			wantHiHi: xdr.Uint64(18446744073709551615), wantHiLo: 18446744073709551615,
+			wantLoHi: 18446744073709551615, wantLoLo: 18446744073709551615,
+		},
+		"i256 zero": {
+			yaml:     `{type: i256, value: "0"}`,
+			wantHiHi: xdr.Int64(0), wantHiLo: 0, wantLoHi: 0, wantLoLo: 0,
+		},
+		"i256 positive one": {
+			yaml:     `{type: i256, value: "1"}`,
+			wantHiHi: xdr.Int64(0), wantHiLo: 0, wantLoHi: 0, wantLoLo: 1,
+		},
+		"i256 negative one": {
+			// Two's complement: -1 is all bits set
+			yaml:     `{type: i256, value: "-1"}`,
+			wantHiHi: xdr.Int64(-1), wantHiLo: 18446744073709551615,
+			wantLoHi: 18446744073709551615, wantLoLo: 18446744073709551615,
+		},
+		"i256 maximum": {
+			// 2^255 - 1
+			yaml:     `{type: i256, value: "57896044618658097711785492504343953926634992332820282019728792003956564819967"}`,
+			wantHiHi: xdr.Int64(9223372036854775807), wantHiLo: 18446744073709551615,
+			wantLoHi: 18446744073709551615, wantLoLo: 18446744073709551615,
+		},
+		"i256 minimum": {
+			// -2^255
+			yaml:     `{type: i256, value: "-57896044618658097711785492504343953926634992332820282019728792003956564819968"}`,
+			wantHiHi: xdr.Int64(-9223372036854775808), wantHiLo: 0, wantLoHi: 0, wantLoLo: 0,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			val, err := argFromYAML(t, tc.yaml).ToScVal()
+			require.NoError(t, err)
+
+			switch want := tc.wantHiHi.(type) {
+			case xdr.Uint64:
+				require.NotNil(t, val.U256)
+				assert.Equal(t, want, val.U256.HiHi)
+				assert.Equal(t, tc.wantHiLo, val.U256.HiLo)
+				assert.Equal(t, tc.wantLoHi, val.U256.LoHi)
+				assert.Equal(t, tc.wantLoLo, val.U256.LoLo)
+			case xdr.Int64:
+				require.NotNil(t, val.I256)
+				assert.Equal(t, want, val.I256.HiHi)
+				assert.Equal(t, tc.wantHiLo, val.I256.HiLo)
+				assert.Equal(t, tc.wantLoHi, val.I256.LoHi)
+				assert.Equal(t, tc.wantLoLo, val.I256.LoLo)
+			}
+
+			_, err = xdr.MarshalBase64(val)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestArgToScVal256BitUnquotedRejection(t *testing.T) {
+	// Unquoted integers for 256-bit numbers must be rejected to prevent YAML rounding.
+	docs := []string{
+		`{type: u256, value: 123456789012345678901234567890}`,
+		`{type: i256, value: 123456789012345678901234567890}`,
+		`{type: u256, value: 42}`,
+		`{type: i256, value: 42}`,
+	}
+	for _, doc := range docs {
+		_, err := argFromYAML(t, doc).ToScVal()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "quoted strings in YAML")
+	}
 }

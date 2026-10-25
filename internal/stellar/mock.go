@@ -27,11 +27,29 @@ type MockClient struct {
 	// Passphrase is returned by NetworkPassphrase.
 	Passphrase string
 
+	// NetworkInfoPassphrase and NetworkInfoErr configure NetworkInfo.
+	NetworkInfoPassphrase string
+	NetworkInfoErr        error
+
 	// Sequence is the sequence number LoadAccount reports.
 	Sequence int64
 
 	// LedgerSeq is returned by LatestLedger.
 	LedgerSeq uint32
+
+	// LatestLedgerErr, if set, makes LatestLedger fail — the shape a network
+	// health check uses to exercise an unreachable endpoint.
+	LatestLedgerErr error
+
+	// ReportPassphrase is returned by ReportNetworkPassphrase. Empty means
+	// reuse Passphrase, which models an endpoint serving its configured
+	// network; set it to a different value to model a URL pointing at the
+	// wrong network.
+	ReportPassphrase string
+
+	// ReportPassphraseErr, if set, makes ReportNetworkPassphrase fail,
+	// modelling an endpoint without getNetwork support.
+	ReportPassphraseErr error
 
 	// SimulateFunc overrides simulation entirely. When nil, Simulate returns
 	// SimulateResponse.
@@ -44,6 +62,12 @@ type MockClient struct {
 	// SendHash.
 	SendFunc func(ctx context.Context, signedTxXDR string) (SendResult, error)
 
+	// AfterSend, if set, runs once for every envelope passed to Send, before
+	// SendFunc. Tests use it to keep the mocked ledger consistent with what a
+	// submitted transaction would have done — for example, moving a contract's
+	// instance to the new WASM hash when an upgrade invocation is accepted.
+	AfterSend func(ctx context.Context, signedTxXDR string)
+
 	// SendHash is the transaction hash reported by the default Send.
 	SendHash string
 
@@ -51,23 +75,36 @@ type MockClient struct {
 	// usable; NewMockClient sets a SUCCESS default.
 	AwaitResponse TxResult
 	AwaitErr      error
+	CloseErr      error
 
 	// Entries maps a base64 LedgerKey to the base64 LedgerEntryData returned
-	// for it. Keys absent from the map are reported as not found, which is how
-	// tests express "this contract is not deployed" or "this wasm is not
-	// uploaded".
+	// for it, as a live entry. Keys absent from both maps are reported as not
+	// found, which is how tests express "this contract is not deployed" or
+	// "this wasm is not uploaded".
 	Entries map[string]string
+
+	// ArchivedEntries maps a base64 LedgerKey to base64 LedgerEntryData for
+	// entries that exist but whose TTL has expired. They are returned with a
+	// liveUntilLedgerSeq of 0, matching how a Protocol 23 RPC reports them.
+	ArchivedEntries map[string]string
+
+	// LedgerEntriesFunc overrides LedgerEntries. When nil, Entries is
+	// consulted. Tests use it to model a node serving stale entries, or to
+	// make an entry appear after a bounded number of reads.
+	LedgerEntriesFunc func(ctx context.Context, keysB64 []string) ([]LedgerEntry, error)
 
 	// LoadAccountErr, if set, makes LoadAccount fail.
 	LoadAccountErr error
 
 	// Recorded calls, for assertions.
-	Simulated []string // unsigned envelopes passed to Simulate
-	Sent      []string // signed envelopes passed to Send
-	Awaited   []string // hashes passed to AwaitTransaction
+	Simulated  []string // unsigned envelopes passed to Simulate
+	Sent       []string // signed envelopes passed to Send
+	Awaited    []string // hashes passed to AwaitTransaction
+	CloseCalls int
 }
 
 var _ Client = (*MockClient)(nil)
+var _ NetworkReporter = (*MockClient)(nil)
 
 // NewMockClient returns a client with workable defaults: testnet passphrase, a
 // successful confirmation, and no ledger entries.
@@ -82,12 +119,32 @@ func NewMockClient() *MockClient {
 			Hash:   "0000000000000000000000000000000000000000000000000000000000000001",
 			Ledger: 1000,
 		},
-		Entries: map[string]string{},
+		Entries:         map[string]string{},
+		ArchivedEntries: map[string]string{},
 	}
 }
 
 // NetworkPassphrase implements Client.
 func (m *MockClient) NetworkPassphrase() string { return m.Passphrase }
+
+// NetworkInfo implements Client.
+func (m *MockClient) NetworkInfo(_ context.Context) (string, error) {
+	if m.NetworkInfoErr != nil {
+		return "", m.NetworkInfoErr
+	}
+	if m.NetworkInfoPassphrase != "" {
+		return m.NetworkInfoPassphrase, nil
+	}
+	return m.Passphrase, nil
+}
+
+// Close implements io.Closer for lifecycle tests.
+func (m *MockClient) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.CloseCalls++
+	return m.CloseErr
+}
 
 // LoadAccount implements Client.
 func (m *MockClient) LoadAccount(_ context.Context, address string) (txnbuild.Account, error) {
@@ -115,6 +172,10 @@ func (m *MockClient) Send(ctx context.Context, signedTxXDR string) (SendResult, 
 	m.Sent = append(m.Sent, signedTxXDR)
 	m.mu.Unlock()
 
+	if m.AfterSend != nil {
+		m.AfterSend(ctx, signedTxXDR)
+	}
+
 	if m.SendFunc != nil {
 		return m.SendFunc(ctx, signedTxXDR)
 	}
@@ -134,15 +195,36 @@ func (m *MockClient) AwaitTransaction(_ context.Context, hash string) (TxResult,
 }
 
 // LedgerEntries implements Client. Keys with no entry are omitted from the
-// result, matching how the RPC reports a missing entry.
-func (m *MockClient) LedgerEntries(_ context.Context, keysB64 []string) ([]LedgerEntry, error) {
+// result, matching how the RPC reports a missing entry. Live entries report a
+// TTL comfortably ahead of the current ledger; archived entries report 0.
+func (m *MockClient) LedgerEntries(ctx context.Context, keysB64 []string) ([]LedgerEntry, error) {
+	if m.LedgerEntriesFunc != nil {
+		return m.LedgerEntriesFunc(ctx, keysB64)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	liveUntil := m.LedgerSeq + 4096
 	var out []LedgerEntry
 	for _, k := range keysB64 {
 		if data, ok := m.Entries[k]; ok {
-			out = append(out, LedgerEntry{KeyXDR: k, DataXDR: data, LastModifiedLedger: m.LedgerSeq})
+			out = append(out, LedgerEntry{
+				KeyXDR:             k,
+				DataXDR:            data,
+				LastModifiedLedger: m.LedgerSeq,
+				LiveUntilLedgerSeq: &liveUntil,
+			})
+			continue
+		}
+		if data, ok := m.ArchivedEntries[k]; ok {
+			archived := uint32(0)
+			out = append(out, LedgerEntry{
+				KeyXDR:             k,
+				DataXDR:            data,
+				LastModifiedLedger: m.LedgerSeq,
+				LiveUntilLedgerSeq: &archived,
+			})
 		}
 	}
 	return out, nil
@@ -150,7 +232,24 @@ func (m *MockClient) LedgerEntries(_ context.Context, keysB64 []string) ([]Ledge
 
 // LatestLedger implements Client.
 func (m *MockClient) LatestLedger(_ context.Context) (uint32, error) {
+	if m.LatestLedgerErr != nil {
+		return 0, m.LatestLedgerErr
+	}
 	return m.LedgerSeq, nil
+}
+
+// ReportNetworkPassphrase implements NetworkReporter. It returns
+// ReportPassphrase when set, otherwise the configured Passphrase, so that a
+// default mock reports a matching network; ReportPassphraseErr stands in for
+// an endpoint whose getNetwork fails or is unsupported.
+func (m *MockClient) ReportNetworkPassphrase(_ context.Context) (string, error) {
+	if m.ReportPassphraseErr != nil {
+		return "", m.ReportPassphraseErr
+	}
+	if m.ReportPassphrase != "" {
+		return m.ReportPassphrase, nil
+	}
+	return m.Passphrase, nil
 }
 
 // SendCount reports how many envelopes were submitted. Dry-run tests assert
@@ -171,13 +270,38 @@ func (m *MockClient) SimulateCount() int {
 // SetContractInstance makes contractID resolve on-chain to wasmHash, so that
 // drift detection and upgrade checks have something to read.
 func (m *MockClient) SetContractInstance(contractID string, wasmHash xdr.Hash) error {
-	key, err := InstanceLedgerKey(contractID)
+	encodedKey, encodedEntry, err := contractInstanceEntry(contractID, wasmHash)
 	if err != nil {
 		return err
 	}
-	encodedKey, err := xdr.MarshalBase64(key)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Entries[encodedKey] = encodedEntry
+	return nil
+}
+
+// SetContractInstanceArchived makes contractID resolve to wasmHash as an
+// archived instance: present, but with an expired TTL.
+func (m *MockClient) SetContractInstanceArchived(contractID string, wasmHash xdr.Hash) error {
+	encodedKey, encodedEntry, err := contractInstanceEntry(contractID, wasmHash)
 	if err != nil {
 		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.Entries, encodedKey)
+	m.ArchivedEntries[encodedKey] = encodedEntry
+	return nil
+}
+
+func contractInstanceEntry(contractID string, wasmHash xdr.Hash) (string, string, error) {
+	key, err := InstanceLedgerKey(contractID)
+	if err != nil {
+		return "", "", err
+	}
+	encodedKey, err := xdr.MarshalBase64(key)
+	if err != nil {
+		return "", "", err
 	}
 
 	hash := wasmHash
@@ -200,6 +324,75 @@ func (m *MockClient) SetContractInstance(contractID string, wasmHash xdr.Hash) e
 	}
 	encodedEntry, err := xdr.MarshalBase64(entry)
 	if err != nil {
+		return "", "", err
+	}
+	return encodedKey, encodedEntry, nil
+}
+
+// SetWasmUploaded marks bytecode as already present on-chain, so that upload
+// steps are skipped.
+func (m *MockClient) SetWasmUploaded(wasmHash xdr.Hash) error {
+	encodedKey, encodedEntry, err := wasmEntry(wasmHash)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Entries[encodedKey] = encodedEntry
+	return nil
+}
+
+// SetWasmArchived marks bytecode as present but archived.
+func (m *MockClient) SetWasmArchived(wasmHash xdr.Hash) error {
+	encodedKey, encodedEntry, err := wasmEntry(wasmHash)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.Entries, encodedKey)
+	m.ArchivedEntries[encodedKey] = encodedEntry
+	return nil
+}
+
+func wasmEntry(wasmHash xdr.Hash) (string, string, error) {
+	encodedKey, err := xdr.MarshalBase64(CodeLedgerKey(wasmHash))
+	if err != nil {
+		return "", "", err
+	}
+	entry := xdr.LedgerEntryData{
+		Type: xdr.LedgerEntryTypeContractCode,
+		ContractCode: &xdr.ContractCodeEntry{
+			Hash: wasmHash,
+			Code: []byte{0x00},
+		},
+	}
+	encodedEntry, err := xdr.MarshalBase64(entry)
+	if err != nil {
+		return "", "", err
+	}
+	return encodedKey, encodedEntry, nil
+}
+
+// SetMaxEntryTTL seeds the network's state archival configuration, which is
+// where MaxEntryTTL reads the extend cap from.
+func (m *MockClient) SetMaxEntryTTL(maxEntryTTL uint32) error {
+	encodedKey, err := xdr.MarshalBase64(StateArchivalConfigKey())
+	if err != nil {
+		return err
+	}
+	entry := xdr.LedgerEntryData{
+		Type: xdr.LedgerEntryTypeConfigSetting,
+		ConfigSetting: &xdr.ConfigSettingEntry{
+			ConfigSettingId: xdr.ConfigSettingIdConfigSettingStateArchival,
+			StateArchivalSettings: &xdr.StateArchivalSettings{
+				MaxEntryTtl:      xdr.Uint32(maxEntryTTL),
+				MinPersistentTtl: xdr.Uint32(1),
+			},
+		},
+	}
+	encodedEntry, err := xdr.MarshalBase64(entry)
+	if err != nil {
 		return err
 	}
 
@@ -209,18 +402,27 @@ func (m *MockClient) SetContractInstance(contractID string, wasmHash xdr.Hash) e
 	return nil
 }
 
-// SetWasmUploaded marks bytecode as already present on-chain, so that upload
-// steps are skipped.
-func (m *MockClient) SetWasmUploaded(wasmHash xdr.Hash) error {
-	encodedKey, err := xdr.MarshalBase64(CodeLedgerKey(wasmHash))
+// SetAccountEntry seeds an account's ledger entry, so that balance and
+// sequence reads have something to report.
+func (m *MockClient) SetAccountEntry(address string, balanceStroops int64, sequence int64) error {
+	accountID, err := xdr.AddressToAccountId(address)
+	if err != nil {
+		return err
+	}
+	key := xdr.LedgerKey{
+		Type:    xdr.LedgerEntryTypeAccount,
+		Account: &xdr.LedgerKeyAccount{AccountId: accountID},
+	}
+	encodedKey, err := xdr.MarshalBase64(key)
 	if err != nil {
 		return err
 	}
 	entry := xdr.LedgerEntryData{
-		Type: xdr.LedgerEntryTypeContractCode,
-		ContractCode: &xdr.ContractCodeEntry{
-			Hash: wasmHash,
-			Code: []byte{0x00},
+		Type: xdr.LedgerEntryTypeAccount,
+		Account: &xdr.AccountEntry{
+			AccountId: accountID,
+			Balance:   xdr.Int64(balanceStroops),
+			SeqNum:    xdr.SequenceNumber(sequence),
 		},
 	}
 	encodedEntry, err := xdr.MarshalBase64(entry)
@@ -295,4 +497,42 @@ func (s *MockSigner) SignCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Signed
+}
+
+// SetSACInstance makes contractID resolve on-chain to a Stellar Asset Contract instance.
+func (m *MockClient) SetSACInstance(contractID string) error {
+	key, err := InstanceLedgerKey(contractID)
+	if err != nil {
+		return err
+	}
+	encodedKey, err := xdr.MarshalBase64(key)
+	if err != nil {
+		return err
+	}
+
+	entry := xdr.LedgerEntryData{
+		Type: xdr.LedgerEntryTypeContractData,
+		ContractData: &xdr.ContractDataEntry{
+			Contract:   mustContractAddress(contractID),
+			Key:        xdr.ScVal{Type: xdr.ScValTypeScvLedgerKeyContractInstance},
+			Durability: xdr.ContractDataDurabilityPersistent,
+			Val: xdr.ScVal{
+				Type: xdr.ScValTypeScvContractInstance,
+				Instance: &xdr.ScContractInstance{
+					Executable: xdr.ContractExecutable{
+						Type: xdr.ContractExecutableTypeContractExecutableStellarAsset,
+					},
+				},
+			},
+		},
+	}
+	encodedEntry, err := xdr.MarshalBase64(entry)
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Entries[encodedKey] = encodedEntry
+	return nil
 }

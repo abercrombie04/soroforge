@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,17 +132,47 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) store.Store) {
 		assert.Empty(t, got)
 	})
 
+	t.Run("contract pages retain list ordering", func(t *testing.T) {
+		s := newStore(t)
+		for _, c := range []store.Contract{
+			{Alias: "b", Network: "testnet", ContractID: "C2", CurrentWasmHash: "b"},
+			{Alias: "a", Network: "testnet", ContractID: "C1", CurrentWasmHash: "a"},
+			{Alias: "c", Network: "mainnet", ContractID: "C3", CurrentWasmHash: "c"},
+		} {
+			_, err := s.UpsertContract(ctx, c)
+			require.NoError(t, err)
+		}
+
+		first, err := s.ListContractsPage(ctx, "", 2, 0)
+		require.NoError(t, err)
+		require.Len(t, first, 2)
+		assert.Equal(t, []string{"mainnet", "testnet"}, []string{first[0].Network, first[1].Network})
+
+		last, err := s.ListContractsPage(ctx, "", 2, 2)
+		require.NoError(t, err)
+		require.Len(t, last, 1)
+		assert.Equal(t, "b", last[0].Alias)
+	})
+
+	t.Run("page arguments must be valid", func(t *testing.T) {
+		s := newStore(t)
+		_, err := s.ListContractsPage(ctx, "", 0, 0)
+		assert.ErrorContains(t, err, "limit")
+		_, err = s.HistoryPage(ctx, "testnet", "counter", 1, -1)
+		assert.ErrorContains(t, err, "offset")
+	})
+
 	t.Run("history records deploys and upgrades newest first", func(t *testing.T) {
 		s := newStore(t)
 
 		for _, d := range []store.Deployment{
 			{
 				Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "v1",
-				Action: store.ActionDeploy, DeployerPubkey: "GABC", TxHash: "tx1", Ledger: 100,
+				Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli", TxHash: "tx1", Ledger: 100,
 			},
 			{
 				Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "v2",
-				Action: store.ActionUpgrade, DeployerPubkey: "GABC", TxHash: "tx2", Ledger: 200,
+				Action: store.ActionUpgrade, DeployerPubkey: "GABC", Actor: "cli", TxHash: "tx2", Ledger: 200,
 				Notes: "fix rounding",
 			},
 		} {
@@ -167,17 +198,17 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) store.Store) {
 
 		_, err := s.RecordDeployment(ctx, store.Deployment{
 			Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "a",
-			Action: store.ActionDeploy, DeployerPubkey: "GABC",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
 		})
 		require.NoError(t, err)
 		_, err = s.RecordDeployment(ctx, store.Deployment{
 			Alias: "counter", Network: "mainnet", ContractID: "C2", WasmHash: "b",
-			Action: store.ActionDeploy, DeployerPubkey: "GABC",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
 		})
 		require.NoError(t, err)
 		_, err = s.RecordDeployment(ctx, store.Deployment{
 			Alias: "token", Network: "testnet", ContractID: "C3", WasmHash: "c",
-			Action: store.ActionDeploy, DeployerPubkey: "GABC",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
 		})
 		require.NoError(t, err)
 
@@ -195,14 +226,57 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) store.Store) {
 		assert.Empty(t, history)
 	})
 
+	t.Run("get deployment by id returns recorded record or ErrNotFound", func(t *testing.T) {
+		s := newStore(t)
+
+		rec, err := s.RecordDeployment(ctx, store.Deployment{
+			Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "v1",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli", TxHash: "tx1", Ledger: 100,
+		})
+		require.NoError(t, err)
+
+		got, err := s.GetDeployment(ctx, rec.ID)
+		require.NoError(t, err)
+		assert.Equal(t, rec.ID, got.ID)
+		assert.Equal(t, "counter", got.Alias)
+		assert.Equal(t, "testnet", got.Network)
+		assert.Equal(t, "v1", got.WasmHash)
+
+		_, err = s.GetDeployment(ctx, 999999)
+		assert.True(t, errors.Is(err, store.ErrNotFound),
+			"expected ErrNotFound for missing deployment id, got %v", err)
+	})
+
+	t.Run("history pages preserve newest-first order", func(t *testing.T) {
+		s := newStore(t)
+		for _, hash := range []string{"v1", "v2", "v3"} {
+			_, err := s.RecordDeployment(ctx, store.Deployment{
+				Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: hash,
+				Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
+			})
+			require.NoError(t, err)
+		}
+
+		first, err := s.HistoryPage(ctx, "testnet", "counter", 2, 0)
+		require.NoError(t, err)
+		require.Len(t, first, 2)
+		assert.Equal(t, []string{"v3", "v2"}, []string{first[0].WasmHash, first[1].WasmHash})
+
+		last, err := s.HistoryPage(ctx, "testnet", "counter", 2, 2)
+		require.NoError(t, err)
+		require.Len(t, last, 1)
+		assert.Equal(t, "v1", last[0].WasmHash)
+	})
+
 	t.Run("optional deployment fields survive a round trip when absent", func(t *testing.T) {
-		// tx_hash, ledger, and notes are nullable; a dry run or a failed
-		// submission leaves them unset and reading them back must not error.
+		// tx_hash, ledger, notes, and constructor_args are nullable; a dry run
+		// or a failed submission leaves them unset and reading them back must
+		// not error.
 		s := newStore(t)
 
 		_, err := s.RecordDeployment(ctx, store.Deployment{
 			Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "a",
-			Action: store.ActionDeploy, DeployerPubkey: "GABC",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
 		})
 		require.NoError(t, err)
 
@@ -212,6 +286,29 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) store.Store) {
 		assert.Empty(t, history[0].TxHash)
 		assert.Zero(t, history[0].Ledger)
 		assert.Empty(t, history[0].Notes)
+		assert.Empty(t, history[0].ConstructorArgs)
+	})
+
+	t.Run("constructor args survive a round trip exactly", func(t *testing.T) {
+		// The recorded arguments are what makes a deployment reproducible
+		// later, so they must come back byte-for-byte — a u128 beyond uint64
+		// is the value most likely to be mangled by a lossy store.
+		s := newStore(t)
+
+		const args = `[{"type":"u32","value":9},` +
+			`{"type":"u128","value":340282366920938463463374607431768211455}]`
+
+		_, err := s.RecordDeployment(ctx, store.Deployment{
+			Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "a",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
+			ConstructorArgs: args,
+		})
+		require.NoError(t, err)
+
+		history, err := s.History(ctx, "testnet", "counter")
+		require.NoError(t, err)
+		require.Len(t, history, 1)
+		assert.Equal(t, args, history[0].ConstructorArgs)
 	})
 
 	t.Run("an upload is recorded without a contract id", func(t *testing.T) {
@@ -222,7 +319,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) store.Store) {
 
 		_, err := s.RecordDeployment(ctx, store.Deployment{
 			Alias: "counter", Network: "testnet", WasmHash: "c0ffee",
-			Action: store.ActionUpload, DeployerPubkey: "GABC",
+			Action: store.ActionUpload, DeployerPubkey: "GABC", Actor: "cli",
 			TxHash: "tx-upload", Ledger: 300,
 		})
 		require.NoError(t, err)
@@ -236,17 +333,243 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) store.Store) {
 		assert.Equal(t, uint32(300), history[0].Ledger)
 	})
 
+	t.Run("list all deployments returns everything in id order", func(t *testing.T) {
+		// `history export` walks this query, so it must reach deployments
+		// whose (network, alias) has no live contract anymore — an alias
+		// removed from soroforge.yaml still owns its history.
+		s := newStore(t)
+
+		_, err := s.RecordDeployment(ctx, store.Deployment{
+			Alias: "old", Network: "testnet", ContractID: "C1", WasmHash: "a",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
+		})
+		require.NoError(t, err)
+		_, err = s.RecordDeployment(ctx, store.Deployment{
+			Alias: "counter", Network: "mainnet", WasmHash: "b",
+			Action: store.ActionUpload, DeployerPubkey: "GXYZ", Actor: "cli",
+		})
+		require.NoError(t, err)
+
+		all, err := s.ListAllDeployments(ctx)
+		require.NoError(t, err)
+		require.Len(t, all, 2)
+		assert.Less(t, all[0].ID, all[1].ID, "export order is insertion order, stable across backends")
+		assert.Equal(t, "old", all[0].Alias)
+		assert.Equal(t, store.ActionUpload, all[1].Action)
+		assert.Empty(t, all[1].ContractID, "uploads have no contract id and must still export")
+	})
+
+	t.Run("list all deployments of an empty store is empty, not nil", func(t *testing.T) {
+		s := newStore(t)
+
+		all, err := s.ListAllDeployments(ctx)
+		require.NoError(t, err)
+		assert.NotNil(t, all)
+		assert.Empty(t, all)
+	})
+
+	t.Run("fee and source metadata survive a round trip", func(t *testing.T) {
+		s := newStore(t)
+		fee := int64(123456)
+		_, err := s.RecordDeployment(ctx, store.Deployment{
+			Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "a",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli", GitCommit: "abc123", Dirty: true,
+			FeeCharged: &fee,
+		})
+		require.NoError(t, err)
+
+		history, err := s.History(ctx, "testnet", "counter")
+		require.NoError(t, err)
+		require.Len(t, history, 1)
+		assert.Equal(t, "abc123", history[0].GitCommit)
+		assert.True(t, history[0].Dirty)
+		require.NotNil(t, history[0].FeeCharged)
+		assert.Equal(t, fee, *history[0].FeeCharged)
+	})
+
+	t.Run("record deployment persists ci_run_url, fn_name, and fn_args", func(t *testing.T) {
+		s := newStore(t)
+
+		saved, err := s.RecordDeployment(ctx, store.Deployment{
+			Alias:          "counter",
+			Network:        "testnet",
+			ContractID:     "C1",
+			WasmHash:       "hash1",
+			Action:         store.ActionInvoke,
+			DeployerPubkey: "GABC",
+			Actor:          "cli",
+			CIRunURL:       "https://github.com/soroworks/soroforge/actions/runs/12345",
+			FnName:         "increment",
+			FnArgs:         "u32:5",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "https://github.com/soroworks/soroforge/actions/runs/12345", saved.CIRunURL)
+		assert.Equal(t, "increment", saved.FnName)
+		assert.Equal(t, "u32:5", saved.FnArgs)
+
+		history, err := s.History(ctx, "testnet", "counter")
+		require.NoError(t, err)
+		require.Len(t, history, 1)
+		assert.Equal(t, store.ActionInvoke, history[0].Action)
+		assert.Equal(t, "https://github.com/soroworks/soroforge/actions/runs/12345", history[0].CIRunURL)
+		assert.Equal(t, "increment", history[0].FnName)
+		assert.Equal(t, "u32:5", history[0].FnArgs)
+	})
+
 	t.Run("invalid records are rejected", func(t *testing.T) {
 		s := newStore(t)
 
 		_, err := s.RecordDeployment(ctx, store.Deployment{
 			Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "a",
-			Action: "sideways", DeployerPubkey: "GABC",
+			Action: "sideways", DeployerPubkey: "GABC", Actor: "cli",
 		})
 		assert.ErrorContains(t, err, "action")
 
 		_, err = s.UpsertContract(ctx, store.Contract{Alias: "counter"})
 		assert.ErrorContains(t, err, "network")
+	})
+
+	t.Run("failed attempts are recorded apart from deployments", func(t *testing.T) {
+		// The core guarantee of deployment_attempts: failures leave a trace,
+		// and they never mix with confirmed history — `status` and drift logic
+		// read a deployments table that has only ever held confirmed changes.
+		s := newStore(t)
+
+		failed, err := s.RecordAttempt(ctx, store.Attempt{
+			Alias: "flaky", Network: "testnet",
+			Action: store.ActionDeploy, Stage: store.AttemptConfirm,
+			Error:  "transaction was included in ledger 42 but failed (status FAILED)",
+			TxHash: "deadbeef",
+		})
+		require.NoError(t, err)
+		assert.NotZero(t, failed.ID)
+		assert.NotZero(t, failed.CreatedAt)
+		assert.Equal(t, store.AttemptConfirm, failed.Stage)
+		assert.Equal(t, "deadbeef", failed.TxHash)
+
+		_, err = s.RecordAttempt(ctx, store.Attempt{
+			Alias: "flaky", Network: "testnet",
+			Action: store.ActionUpgrade, Stage: store.AttemptSubmit,
+			Error: "transaction rejected by the network",
+		})
+		require.NoError(t, err)
+
+		// A deployment of the same contract must not mix with the failures.
+		_, err = s.RecordDeployment(ctx, store.Deployment{
+			Alias: "flaky", Network: "testnet", ContractID: "CFLAKY", WasmHash: "a",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
+		})
+		require.NoError(t, err)
+
+		history, err := s.History(ctx, "testnet", "flaky")
+		require.NoError(t, err)
+		require.Len(t, history, 1, "failures must never surface as deployments")
+		assert.Equal(t, "CFLAKY", history[0].ContractID)
+
+		attempts, err := s.Attempts(ctx, "testnet", "flaky")
+		require.NoError(t, err)
+		require.Len(t, attempts, 2)
+		assert.Equal(t, store.ActionUpgrade, attempts[0].Action, "newest first")
+		assert.Equal(t, store.ActionDeploy, attempts[1].Action)
+		assert.Empty(t, attempts[0].TxHash, "a rejected submission got no hash")
+		assert.Equal(t, "deadbeef", attempts[1].TxHash)
+
+		// Unknown contracts and networks are simply empty, not errors.
+		none, err := s.Attempts(ctx, "testnet", "never-attempted")
+		require.NoError(t, err)
+		assert.Empty(t, none)
+
+		otherNet, err := s.Attempts(ctx, "futurenet", "flaky")
+		require.NoError(t, err)
+		assert.Empty(t, otherNet, "attempts are scoped per network like everything else")
+	})
+
+	t.Run("pruning removes only attempts older than the cutoff", func(t *testing.T) {
+		s := newStore(t)
+		_, err := s.RecordAttempt(ctx, store.Attempt{
+			Alias: "flaky", Network: "testnet", Action: store.ActionDeploy,
+			Stage: store.AttemptSubmit, Error: "old failure",
+		})
+		require.NoError(t, err)
+		cutoff := time.Now().Add(20 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
+		_, err = s.RecordAttempt(ctx, store.Attempt{
+			Alias: "flaky", Network: "testnet", Action: store.ActionUpgrade,
+			Stage: store.AttemptSubmit, Error: "new failure",
+		})
+		require.NoError(t, err)
+		_, err = s.RecordDeployment(ctx, store.Deployment{
+			Alias: "flaky", Network: "testnet", ContractID: "CFLAKY", WasmHash: "a",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
+		})
+		require.NoError(t, err)
+
+		count, err := s.CountAttemptsBefore(ctx, cutoff)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+		removed, err := s.PruneAttempts(ctx, cutoff)
+		require.NoError(t, err)
+		assert.Equal(t, 1, removed)
+
+		attempts, err := s.Attempts(ctx, "testnet", "flaky")
+		require.NoError(t, err)
+		require.Len(t, attempts, 1)
+		assert.Equal(t, "new failure", attempts[0].Error)
+		history, err := s.History(ctx, "testnet", "flaky")
+		require.NoError(t, err)
+		require.Len(t, history, 1, "pruning attempts must not delete confirmed deployments")
+	})
+
+	t.Run("attempt error text never keeps key material", func(t *testing.T) {
+		// Error text may quote RPC responses — but a secret seed that reaches
+		// it must be redacted before the row is written, and again on read the
+		// seed must be gone. This is the issue's stated assertion.
+		s := newStore(t)
+
+		seed := "S" + strings.Repeat("A", 55) // well-formed secret seed shape
+		_, err := s.RecordAttempt(ctx, store.Attempt{
+			Alias: "flaky", Network: "testnet",
+			Action: store.ActionDeploy, Stage: store.AttemptSimulate,
+			Error: "signing failed: rpc echoed " + seed + " back",
+		})
+		require.NoError(t, err)
+
+		attempts, err := s.Attempts(ctx, "testnet", "flaky")
+		require.NoError(t, err)
+		require.Len(t, attempts, 1)
+		assert.NotContains(t, attempts[0].Error, seed)
+		assert.Contains(t, attempts[0].Error, "[REDACTED-SECRET-KEY]")
+	})
+
+	t.Run("invalid attempts are rejected", func(t *testing.T) {
+		s := newStore(t)
+
+		_, err := s.RecordAttempt(ctx, store.Attempt{
+			Alias: "flaky", Network: "testnet",
+			Action: store.ActionDeploy, Stage: "rollback", Error: "boom",
+		})
+		assert.ErrorContains(t, err, "stage")
+
+		_, err = s.RecordAttempt(ctx, store.Attempt{
+			Alias: "flaky", Network: "testnet",
+			Action: "sideways", Stage: store.AttemptSubmit, Error: "boom",
+		})
+		assert.ErrorContains(t, err, "action")
+
+		_, err = s.RecordAttempt(ctx, store.Attempt{
+			Network: "testnet", Action: store.ActionDeploy, Stage: store.AttemptSubmit, Error: "boom",
+		})
+		assert.ErrorContains(t, err, "alias")
+
+		_, err = s.RecordAttempt(ctx, store.Attempt{
+			Alias: "flaky", Action: store.ActionDeploy, Stage: store.AttemptSubmit, Error: "boom",
+		})
+		assert.ErrorContains(t, err, "network")
+
+		_, err = s.RecordAttempt(ctx, store.Attempt{
+			Alias: "flaky", Network: "testnet", Action: store.ActionDeploy, Stage: store.AttemptSimulate,
+		})
+		assert.ErrorContains(t, err, "error")
 	})
 }
 
@@ -270,7 +593,7 @@ func TestMemoryStoreHistoryOrdersByIDWhenTimestampsTie(t *testing.T) {
 		}
 		_, err := s.RecordDeployment(ctx, store.Deployment{
 			Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: hash,
-			Action: action, DeployerPubkey: "GABC",
+			Action: action, DeployerPubkey: "GABC", Actor: "cli",
 		})
 		require.NoError(t, err)
 	}
@@ -286,6 +609,9 @@ func TestActionValid(t *testing.T) {
 	assert.True(t, store.ActionDeploy.Valid())
 	assert.True(t, store.ActionUpgrade.Valid())
 	assert.True(t, store.ActionUpload.Valid())
+	assert.True(t, store.ActionExtend.Valid())
+	assert.True(t, store.ActionRestore.Valid())
+	assert.True(t, store.ActionInvoke.Valid())
 	assert.False(t, store.Action("rollback").Valid())
 	assert.False(t, store.Action("").Valid())
 }
@@ -293,7 +619,7 @@ func TestActionValid(t *testing.T) {
 func TestDeploymentValidate(t *testing.T) {
 	valid := store.Deployment{
 		Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "a",
-		Action: store.ActionDeploy, DeployerPubkey: "GABC",
+		Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
 	}
 	require.NoError(t, valid.Validate())
 
@@ -320,4 +646,52 @@ func TestDeploymentValidate(t *testing.T) {
 		upload.ContractID = ""
 		assert.NoError(t, upload.Validate())
 	})
+}
+
+func TestAttemptValidate(t *testing.T) {
+	valid := store.Attempt{
+		Alias: "counter", Network: "testnet",
+		Action: store.ActionDeploy, Stage: store.AttemptSubmit,
+		Error: "boom",
+	}
+	require.NoError(t, valid.Validate())
+
+	tests := map[string]func(a *store.Attempt){
+		"alias":    func(a *store.Attempt) { a.Alias = "" },
+		"network":  func(a *store.Attempt) { a.Network = "" },
+		"error":    func(a *store.Attempt) { a.Error = "" },
+		"action":   func(a *store.Attempt) { a.Action = "sideways" },
+		"stage":    func(a *store.Attempt) { a.Stage = "rollback" },
+		"emptystg": func(a *store.Attempt) { a.Stage = "" },
+	}
+	for field, break_ := range tests {
+		t.Run("broken "+field, func(t *testing.T) {
+			a := valid
+			break_(&a)
+			assert.Error(t, a.Validate())
+		})
+	}
+
+	assert.True(t, store.AttemptSimulate.Valid())
+	assert.True(t, store.AttemptSubmit.Valid())
+	assert.True(t, store.AttemptConfirm.Valid())
+}
+
+func TestSanitizeKeyMaterial(t *testing.T) {
+	seed := "S" + strings.Repeat("A", 55)
+
+	got := store.SanitizeKeyMaterial("rpc response mentioned " + seed + " twice: " + seed)
+	assert.NotContains(t, got, seed)
+	assert.Equal(t, 2, strings.Count(got, "[REDACTED-SECRET-KEY]"))
+
+	// Text without key material survives untouched — the redaction is a
+	// filter for seeds, not a scrub of the whole message.
+	plain := "transaction 0abc failed with HostError: missing contract"
+	assert.Equal(t, plain, store.SanitizeKeyMaterial(plain))
+
+	// A G-address (public) is not key material and must survive, and a
+	// shorter or differently-shaped string is not falsely redacted.
+	pubkey := "G" + strings.Repeat("A", 55)
+	assert.Equal(t, pubkey, store.SanitizeKeyMaterial(pubkey))
+	assert.Equal(t, "SAAAA", store.SanitizeKeyMaterial("SAAAA"))
 }

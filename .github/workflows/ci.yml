@@ -6,17 +6,89 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets the auto-merge bot re-run CI on main after it merges a PR.
+  workflow_dispatch:
 
 permissions:
   contents: read
+  # Read the coverage baseline uploaded by the latest successful run on main.
+  actions: read
 
 env:
   # Build and test on a Go release that still gets security fixes. The
   # module minimum (go.mod) stays at what the Stellar SDK requires.
   GO_VERSION: "1.26"
+  # A pull request fails if total coverage drops by more than this many
+  # percentage points compared with main.
+  COVERAGE_MAX_DROP: "1.0"
 
 jobs:
   test:
+    name: test (${{ matrix.os }})
+    # Every supported OS runs the unit suite: releases ship macOS and Windows
+    # binaries, and path handling, keystore reading and line endings all
+    # differ by platform, so a failure should surface here rather than after
+    # a tag. The Postgres half lives in the integration job below, because
+    # GitHub Actions service containers only exist on Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            race: "-race"
+          - os: macos-latest
+            race: "-race"
+          # The Windows race detector needs cgo and a C toolchain, which the
+          # runner does not provide by default. The detector still runs on
+          # the other two legs of the matrix.
+          - os: windows-latest
+            race: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          # Always the newest patch release: security fixes land there.
+          check-latest: true
+
+      # bash on every runner: gofmt -l . is a POSIX one-liner, and Windows
+      # would otherwise land in PowerShell with different quoting.
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        shell: bash
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ${{ matrix.race }} -count=1 ./...
+
+  integration:
+    name: postgres integration
+    # Deliberately Linux-only: service containers are a GitHub Actions
+    # Linux-runner feature, so Postgres cannot be attached to the macOS or
+    # Windows legs. Those legs still compile and run the whole unit suite,
+    # which skips the database-gated cases; this job is what exercises them.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,37 +118,94 @@ jobs:
           # Always the newest patch release: security fixes land there.
           check-latest: true
 
-      - name: Check formatting
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "These files are not gofmt'd:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: Verify go.mod is tidy
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Build
-        run: go build ./...
-
       # TEST_DATABASE_URL turns on the Postgres half of the store
-      # conformance suite; without it those cases would silently skip.
-      # The live testnet smoke tests stay off: CI must not depend on a
-      # public RPC endpoint being up.
+      # conformance suite, including the migration round-trip test; without
+      # it those cases would silently skip. The live testnet smoke tests stay
+      # off: CI must not depend on a public RPC endpoint being up.
       - name: Test
         env:
           TEST_DATABASE_URL: postgres://soroforge:soroforge@localhost:5432/soroforge?sslmode=disable
         run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
 
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out | tail -1
+      # main keeps its profile as the baseline pull requests compare against.
+      - name: Upload coverage baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-main
+          path: coverage.out
+          retention-days: 90
+
+      # Fetches coverage.out from the newest successful CI run on main. No
+      # third-party service: the baseline is an artifact of this workflow.
+      - name: Download coverage baseline
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --branch main --event push --status success --limit 1 \
+            --json databaseId -q '.[0].databaseId')
+          if [ -n "$run_id" ] && gh run download "$run_id" -R "$GITHUB_REPOSITORY" \
+              -n coverage-main -D coverage-base; then
+            echo "Baseline: run $run_id on main"
+          else
+            echo "::notice::No coverage baseline from main yet; reporting without the regression check."
+          fi
+
+      # Writes a per-package table to the job summary. On a pull request it
+      # also shows the change against main and fails on a large regression.
+      - name: Coverage report
+        run: |
+          if [ -f coverage-base/coverage.out ]; then
+            scripts/coverage.sh coverage.out coverage-base/coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            scripts/coverage.sh coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Lint OpenAPI document
+        run: npx --yes @redocly/cli lint --extends minimal internal/api/openapi.json
+
+  # Deploys and upgrades a real contract against a standalone Stellar network
+  # (stellar/quickstart in local mode, with RPC and Friendbot), which no mock
+  # can prove. Behind the e2e build tag so `make check` stays offline. The image
+  # tag is pinned: see internal/e2e/README.md before changing it.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          check-latest: true
+
+      - name: Start local Stellar network
+        run: |
+          docker run -d --name stellar -p 8000:8000 stellar/quickstart:v678-b1525.1-latest --local --enable rpc
+          # The container is up long before the node is. Wait for RPC to
+          # report healthy; the test itself retries Friendbot.
+          for i in $(seq 1 90); do
+            if curl -sf -X POST -H 'Content-Type: application/json'                  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'                  http://localhost:8000/rpc | grep -q healthy; then
+              echo "RPC healthy after $((i * 5))s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::local network did not become healthy"
+          docker logs stellar | tail -50
+          exit 1
+
+      - name: End-to-end test
+        run: go test -tags e2e ./internal/e2e/ -count=1 -v
+
+      - name: Network logs on failure
+        if: failure()
+        run: docker logs stellar | tail -100
 
   docker:
     runs-on: ubuntu-latest
@@ -86,3 +215,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build image
         run: docker build -t soroforge:ci .
+
+  helm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Helm lint
+        run: helm lint deploy/helm/soroforge
+      - name: Helm template
+        run: helm template soroforge deploy/helm/soroforge

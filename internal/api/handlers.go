@@ -1,7 +1,10 @@
 package api
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/soroworks/soroforge/internal/deploy"
@@ -41,12 +44,33 @@ func (h *handlers) ready(w http.ResponseWriter, r *http.Request) {
 // deploy handles POST /v1/deploy.
 func (h *handlers) deploy(w http.ResponseWriter, r *http.Request) {
 	var req deploy.DeployRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if err := decodeBody(w, r, &req); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 	if req.Alias == "" {
 		writeError(w, http.StatusBadRequest, "alias is required")
+		return
+	}
+
+	// Get the token name from the request context for audit trail.
+	if info := requestInfoFrom(r.Context()); info != nil && info.tokenName != "" {
+		req.Actor = info.tokenName
+	}
+
+	async, err := asyncRequested(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if async {
+		h.submitJob(w, jobSpec{
+			alias:   req.Alias,
+			network: req.Network,
+			run: func(ctx context.Context) (any, error) {
+				return h.svc.Deploy(ctx, req)
+			},
+		})
 		return
 	}
 
@@ -68,12 +92,33 @@ func (h *handlers) deploy(w http.ResponseWriter, r *http.Request) {
 // upgrade handles POST /v1/upgrade.
 func (h *handlers) upgrade(w http.ResponseWriter, r *http.Request) {
 	var req deploy.UpgradeRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if err := decodeBody(w, r, &req); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 	if req.Alias == "" {
 		writeError(w, http.StatusBadRequest, "alias is required")
+		return
+	}
+
+	// Get the token name from the request context for audit trail.
+	if info := requestInfoFrom(r.Context()); info != nil && info.tokenName != "" {
+		req.Actor = info.tokenName
+	}
+
+	async, err := asyncRequested(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if async {
+		h.submitJob(w, jobSpec{
+			alias:   req.Alias,
+			network: req.Network,
+			run: func(ctx context.Context) (any, error) {
+				return h.svc.Upgrade(ctx, req)
+			},
+		})
 		return
 	}
 
@@ -86,45 +131,209 @@ func (h *handlers) upgrade(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// track handles POST /v1/track.
+func (h *handlers) track(w http.ResponseWriter, r *http.Request) {
+	var req deploy.TrackRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if req.Alias == "" {
+		writeError(w, http.StatusBadRequest, "alias is required")
+		return
+	}
+	if req.ContractID == "" {
+		writeError(w, http.StatusBadRequest, "contract_id is required")
+		return
+	}
+
+	// Get the token name from the request context for audit trail.
+	if info := requestInfoFrom(r.Context()); info != nil && info.tokenName != "" {
+		req.Actor = info.tokenName
+	}
+
+	async, err := asyncRequested(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if async {
+		h.submitJob(w, jobSpec{
+			alias:   req.Alias,
+			network: req.Network,
+			run: func(ctx context.Context) (any, error) {
+				return h.svc.Track(ctx, req)
+			},
+		})
+		return
+	}
+
+	result, err := h.svc.Track(r.Context(), req)
+	if err != nil {
+		h.log.Error("track failed", "alias", req.Alias, "network", req.Network, "error", err)
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, result)
+}
+
+// asyncRequested reports whether the caller asked for a background job via
+// ?async=true. Any other non-empty value is an error rather than a silent
+// synchronous deploy: a client that meant to go async must not block for
+// minutes because of a typo.
+func asyncRequested(r *http.Request) (bool, error) {
+	raw := r.URL.Query().Get("async")
+	if raw == "" {
+		return false, nil
+	}
+	async, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("invalid async value %q: expected true or false", raw)
+	}
+	return async, nil
+}
+
+// submitJob starts a background job and returns 202 immediately. The Location
+// header points at the URL that reports its progress.
+func (h *handlers) submitJob(w http.ResponseWriter, spec jobSpec) {
+	job, err := h.jobs.submit(spec)
+	if err != nil {
+		h.log.Error("could not create async job", "alias", spec.alias, "error", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Location", "/v1/jobs/"+job.ID)
+	writeJSON(w, http.StatusAccepted, job)
+}
+
+// job handles GET /v1/jobs/{id}.
+func (h *handlers) job(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	job, ok := h.jobs.get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("job %s not found", id))
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
 // listContractsResponse wraps the list so the payload can gain fields later
 // without becoming a breaking change for clients parsing a bare array.
 type listContractsResponse struct {
-	Contracts []store.Contract `json:"contracts"`
+	Contracts  []store.Contract `json:"contracts"`
+	Limit      int              `json:"limit"`
+	Offset     int              `json:"offset"`
+	HasMore    bool             `json:"has_more"`
+	NextOffset *int             `json:"next_offset,omitempty"`
+}
+
+const (
+	defaultPageSize = 100
+	maxPageSize     = 500
+)
+
+type pageParams struct {
+	limit  int
+	offset int
+}
+
+func parsePageParams(r *http.Request) (pageParams, error) {
+	params := pageParams{limit: defaultPageSize}
+	query := r.URL.Query()
+	if values, ok := query["limit"]; ok {
+		if len(values) != 1 {
+			return pageParams{}, fmt.Errorf("limit must be specified once")
+		}
+		limit, err := strconv.Atoi(values[0])
+		if err != nil || limit < 1 || limit > maxPageSize {
+			return pageParams{}, fmt.Errorf("limit must be between 1 and %d", maxPageSize)
+		}
+		params.limit = limit
+	}
+	if values, ok := query["offset"]; ok {
+		if len(values) != 1 {
+			return pageParams{}, fmt.Errorf("offset must be specified once")
+		}
+		offset, err := strconv.Atoi(values[0])
+		if err != nil || offset < 0 {
+			return pageParams{}, fmt.Errorf("offset must be a non-negative integer")
+		}
+		params.offset = offset
+	}
+	return params, nil
+}
+
+func nextPage[T any](items []T, params pageParams) ([]T, bool, *int) {
+	if len(items) <= params.limit {
+		return items, false, nil
+	}
+	nextOffset := params.offset + params.limit
+	return items[:params.limit], true, &nextOffset
 }
 
 // listContracts handles GET /v1/contracts?network=.
 func (h *handlers) listContracts(w http.ResponseWriter, r *http.Request) {
 	network := r.URL.Query().Get("network")
+	params, err := parsePageParams(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	contracts, err := h.svc.List(r.Context(), network)
+	contracts, err := h.svc.ListPage(r.Context(), network, params.limit+1, params.offset)
 	if err != nil {
 		writeError(w, statusForError(err), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, listContractsResponse{Contracts: contracts})
+	contracts, hasMore, nextOffset := nextPage(contracts, params)
+	writeJSON(w, http.StatusOK, listContractsResponse{
+		Contracts: contracts, Limit: params.limit, Offset: params.offset,
+		HasMore: hasMore, NextOffset: nextOffset,
+	})
 }
 
 type historyResponse struct {
 	Alias       string             `json:"alias"`
 	Network     string             `json:"network"`
 	Deployments []store.Deployment `json:"deployments"`
+	Limit       int                `json:"limit"`
+	Offset      int                `json:"offset"`
+	HasMore     bool               `json:"has_more"`
+	NextOffset  *int               `json:"next_offset,omitempty"`
 }
 
 // history handles GET /v1/contracts/{network}/{alias}/history.
 func (h *handlers) history(w http.ResponseWriter, r *http.Request) {
 	network := chi.URLParam(r, "network")
 	alias := chi.URLParam(r, "alias")
+	params, err := parsePageParams(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	deployments, err := h.svc.History(r.Context(), network, alias)
+	deployments, err := h.svc.HistoryPage(r.Context(), network, alias, params.limit+1, params.offset)
 	if err != nil {
 		writeError(w, statusForError(err), err.Error())
 		return
 	}
+	deployments, hasMore, nextOffset := nextPage(deployments, params)
 	writeJSON(w, http.StatusOK, historyResponse{
 		Alias:       alias,
 		Network:     network,
 		Deployments: deployments,
+		Limit:       params.limit,
+		Offset:      params.offset,
+		HasMore:     hasMore,
+		NextOffset:  nextOffset,
 	})
+}
+
+func (h *handlers) openapi(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(openAPIDocument)
 }
 
 // status handles GET /v1/contracts/{network}/{alias}/status.
@@ -157,4 +366,21 @@ func (h *handlers) statusAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// getDeployment handles GET /v1/deployments/{id}.
+func (h *handlers) getDeployment(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid deployment id")
+		return
+	}
+
+	deployment, err := h.svc.GetDeployment(r.Context(), id)
+	if err != nil {
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, deployment)
 }

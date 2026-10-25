@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	"github.com/stellar/go-stellar-sdk/txnbuild"
 )
 
 // SupportedVersion is the only soroforge.yaml schema version understood today.
@@ -15,9 +17,8 @@ const SupportedVersion = 1
 //
 // It reports every problem it finds rather than stopping at the first, because
 // fixing a config one error per run is a miserable way to start with a tool.
-// Filesystem checks are deliberately excluded: whether a WASM artifact exists
-// yet depends on whether the contract has been built, which is not a property
-// of the configuration.
+// Filesystem and network checks are deliberately excluded; `soroforge config
+// check` performs those environment-dependent checks on demand.
 func (c *Config) Validate() error {
 	var problems []string
 
@@ -48,7 +49,7 @@ func (c *Config) Validate() error {
 		problems = append(problems, "contracts: at least one contract must be configured")
 	}
 	for _, alias := range sortedKeys(c.Contracts) {
-		problems = append(problems, validateContract(alias, c.Contracts[alias])...)
+		problems = append(problems, validateContract(alias, c.Contracts[alias], c.Networks)...)
 	}
 
 	if len(problems) == 0 {
@@ -80,14 +81,31 @@ func validateNetwork(name string, n Network) []string {
 		return []string{"networks: network names must not be empty"}
 	}
 
+	// URLs are checked expanded, but a parse error quotes the value it failed
+	// on, so the problem is reported with any ${NAME} reference unexpanded.
 	if strings.TrimSpace(n.RPCURL) == "" {
 		problems = append(problems, prefix+".rpc_url: must be set")
 	} else if p := checkHTTPURL(prefix+".rpc_url", n.RPCURL); p != "" {
-		problems = append(problems, p)
+		problems = append(problems, n.RedactURLs(p))
 	}
 
 	if n.SoroVaultURL != "" {
 		if p := checkHTTPURL(prefix+".sorovault_url", n.SoroVaultURL); p != "" {
+			problems = append(problems, n.RedactURLs(p))
+		}
+	}
+
+	if n.ExplorerURL != "" {
+		if p := checkHTTPURL(prefix+".explorer_url", n.ExplorerURL); p != "" {
+			problems = append(problems, p)
+		}
+	}
+
+	for i, wh := range n.Webhooks {
+		field := fmt.Sprintf("%s.webhooks[%d].url", prefix, i)
+		if strings.TrimSpace(wh.URL) == "" {
+			problems = append(problems, field+": must be set")
+		} else if p := checkHTTPURL(field, wh.URL); p != "" {
 			problems = append(problems, p)
 		}
 	}
@@ -101,7 +119,7 @@ func validateNetwork(name string, n Network) []string {
 	return problems
 }
 
-func validateContract(alias string, c Contract) []string {
+func validateContract(alias string, c Contract, networks map[string]Network) []string {
 	var problems []string
 	prefix := fmt.Sprintf("contracts.%s", alias)
 
@@ -109,23 +127,96 @@ func validateContract(alias string, c Contract) []string {
 		return []string{"contracts: contract aliases must not be empty"}
 	}
 
-	if strings.TrimSpace(c.Wasm) == "" {
-		problems = append(problems, prefix+".wasm: must be set")
-	}
+	hasWasm := strings.TrimSpace(c.Wasm) != ""
+	hasAsset := strings.TrimSpace(c.Asset) != ""
 
-	for i, arg := range c.ConstructorArgs {
-		if _, err := arg.ToScVal(); err != nil {
-			problems = append(problems, fmt.Sprintf("%s.constructor_args[%d]: %v", prefix, i, err))
+	switch {
+	case !hasWasm && !hasAsset:
+		problems = append(problems, prefix+".wasm: must be set")
+	case hasWasm && hasAsset:
+		problems = append(problems, prefix+": wasm and asset are mutually exclusive")
+	case hasAsset:
+		if err := validateAsset(c.Asset); err != nil {
+			problems = append(problems, fmt.Sprintf("%s.asset: %v", prefix, err))
+		}
+		if len(c.ConstructorArgs) > 0 {
+			problems = append(problems, prefix+": Stellar Asset Contracts do not take constructor args")
+		}
+		if c.Salt != "" {
+			problems = append(problems, prefix+": Stellar Asset Contracts derive their ID from the asset; salt cannot be used")
+		}
+		if strings.TrimSpace(c.InitFunc) != "" || len(c.InitArgs) > 0 {
+			problems = append(problems, prefix+": Stellar Asset Contracts are not initialized; init_fn and init_args cannot be used")
+		}
+	case hasWasm:
+		for i, arg := range c.ConstructorArgs {
+			if _, err := arg.ToScVal(); err != nil {
+				problems = append(problems, fmt.Sprintf("%s.constructor_args[%d]: %v", prefix, i, err))
+			}
+		}
+
+		if strings.TrimSpace(c.InitFunc) != "" && len(c.ConstructorArgs) > 0 {
+			problems = append(problems, fmt.Sprintf("%s: cannot configure both constructor_args and init_fn", prefix))
+		}
+
+		for i, arg := range c.InitArgs {
+			if _, err := arg.ToScVal(); err != nil {
+				problems = append(problems, fmt.Sprintf("%s.init_args[%d]: %v", prefix, i, err))
+			}
+		}
+
+		if len(c.InitArgs) > 0 && strings.TrimSpace(c.InitFunc) == "" {
+			problems = append(problems, prefix+".init_args: init_fn must be set when init_args are configured")
+		}
+
+		if c.Salt != "" {
+			if _, err := ParseSalt(c.Salt); err != nil {
+				problems = append(problems, fmt.Sprintf("%s.salt: %v", prefix, err))
+			}
 		}
 	}
 
-	if c.Salt != "" {
-		if _, err := ParseSalt(c.Salt); err != nil {
-			problems = append(problems, fmt.Sprintf("%s.salt: %v", prefix, err))
+	// Overrides are validated in their own context, with the full path
+	// (`contracts.token.networks.mainnet.salt`) so a bad override cannot be
+	// mistaken for the contract-level setting it replaces.
+	for _, network := range sortedKeys(c.Networks) {
+		problems = append(problems, validateContractOverride(prefix, network, c.Networks[network], networks)...)
+	}
+
+	return problems
+}
+
+func validateContractOverride(prefix, network string, o ContractOverride, networks map[string]Network) []string {
+	var problems []string
+	overridePrefix := fmt.Sprintf("%s.networks.%s", prefix, network)
+
+	if _, ok := networks[network]; !ok {
+		problems = append(problems, fmt.Sprintf(
+			"%s: unknown network (configured: %s)", overridePrefix, joinKeys(networks)))
+	}
+
+	for i, arg := range o.ConstructorArgs {
+		if _, err := arg.ToScVal(); err != nil {
+			problems = append(problems, fmt.Sprintf("%s.constructor_args[%d]: %v", overridePrefix, i, err))
+		}
+	}
+
+	if o.Salt != "" {
+		if _, err := ParseSalt(o.Salt); err != nil {
+			problems = append(problems, fmt.Sprintf("%s.salt: %v", overridePrefix, err))
 		}
 	}
 
 	return problems
+}
+
+func validateAsset(s string) error {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return errors.New("must not be empty")
+	}
+	_, err := txnbuild.ParseAssetString(trimmed)
+	return err
 }
 
 func sortedKeys[V any](m map[string]V) []string {

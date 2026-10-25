@@ -62,7 +62,7 @@ func truncate(t *testing.T, url string) {
 	require.NoError(t, err)
 	defer pool.Close()
 
-	_, err = pool.Exec(ctx, "TRUNCATE contracts, deployments RESTART IDENTITY")
+	_, err = pool.Exec(ctx, "TRUNCATE contracts, deployments, deployment_attempts RESTART IDENTITY")
 	require.NoError(t, err)
 }
 
@@ -70,6 +70,12 @@ func TestPostgresStore(t *testing.T) {
 	// The same suite MemoryStore passes, so the fake used everywhere else is
 	// held to real database semantics.
 	runStoreSuite(t, newPostgresStore)
+}
+
+func TestPostgresHistory(t *testing.T) {
+	// Export/import losslessness must hold against the production backend
+	// too, not just the in-memory and SQLite ones.
+	runHistorySuite(t, newPostgresStore)
 }
 
 func TestPostgresMigrationsAreReversible(t *testing.T) {
@@ -84,12 +90,15 @@ func TestPostgresMigrationsAreReversible(t *testing.T) {
 	version, dirty, err := migrator.Version()
 	require.NoError(t, err)
 	require.False(t, dirty, "migrations must not leave the database dirty")
-	require.Equal(t, uint(2), version)
+	// Bump this alongside every new migration: it is what catches a migration
+	// file that is present but never applied.
+	require.Equal(t, uint(10), version)
 
-	// The suite that runs first leaves rows behind, and reverting 000002
-	// narrows the action constraint — with an 'upload' row present the ADD
-	// CONSTRAINT correctly refuses, by design. Reversibility is a schema
-	// property, so prove it against a clean table.
+	// The suite that runs first leaves rows behind, and reverting the
+	// action-constraint migrations (000002, 000004, 000007) narrows the action
+	// constraint — with a row using a newer action present the ADD CONSTRAINT
+	// correctly refuses, by design. Reversibility is a schema property, so
+	// prove it against a clean table.
 	truncate(t, url)
 
 	require.NoError(t, migrator.Down())

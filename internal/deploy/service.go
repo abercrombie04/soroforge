@@ -14,9 +14,14 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math/rand"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/soroworks/soroforge/internal/catalog"
@@ -46,7 +51,7 @@ func DefaultClientFactory(_ string, network config.Network) (stellar.Client, err
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf(
 			"invalid RPC URL %q: expected an http or https URL with a host (e.g. https://soroban-testnet.stellar.org)",
-			network.RPCURL)
+			network.DisplayRPCURL())
 	}
 	return stellar.NewRPCClient(stellar.RPCOptions{
 		URL:               network.RPCURL,
@@ -62,6 +67,10 @@ type Service struct {
 	clients ClientFactory
 	log     *slog.Logger
 
+	clientMu    sync.Mutex
+	clientCache map[string]stellar.Client
+	closed      bool
+
 	// baseFee is the per-operation fee in stroops. The resource fee that
 	// simulation determines is added on top of it.
 	baseFee int64
@@ -70,8 +79,24 @@ type Service struct {
 	// reach a terminal state.
 	confirmTimeout time.Duration
 
+	// verifyAttempts and verifyDelay bound the post-upgrade re-read of the
+	// contract's WASM hash. The change can take one ledger close to become
+	// visible to the RPC node answering the read, so the first read may
+	// legitimately report the old hash.
+	verifyAttempts int
+	verifyDelay    time.Duration
+
+	// maxContractSize is the largest contract WASM that will be uploaded.
+	maxContractSize int
+
 	// catalog publishes confirmed contracts to a network's sorovault_url.
 	catalog catalog.Registrar
+
+	// progress, when set, reports what a transaction is doing while it waits.
+	progress ProgressFunc
+
+	// webhooks delivers notifications to endpoints configured on a network.
+	webhooks WebhookSender
 }
 
 // Options configures a Service. Config, Store, and Signer are required.
@@ -96,10 +121,33 @@ type Options struct {
 	// ConfirmTimeout defaults to DefaultConfirmTimeout.
 	ConfirmTimeout time.Duration
 
+	// VerifyAttempts bounds how many times Upgrade re-reads the contract's
+	// on-chain WASM hash after its upgrade transaction confirms. Defaults to
+	// DefaultVerifyAttempts; tests set it low.
+	VerifyAttempts int
+
+	// VerifyDelay is the wait between those re-reads. Defaults to
+	// DefaultVerifyDelay; tests set it low.
+	VerifyDelay time.Duration
+
+	// MaxContractSize is the largest contract WASM SoroForge will upload, in
+	// bytes. Defaults to stellar.DefaultMaxContractSize; a non-positive value
+	// also selects the default, since refusing every upload is never intended.
+	MaxContractSize int
+
 	// Catalog registers confirmed deploys and upgrades with the network's
 	// sorovault_url, when one is configured. Defaults to a SoroVault HTTP
 	// client; tests replace it.
 	Catalog catalog.Registrar
+
+	// Progress receives progress events while transactions are in flight. It
+	// is the CLI's hook for showing that a deploy is not hung; the HTTP API
+	// leaves it nil, so service behaviour is identical with and without it.
+	Progress ProgressFunc
+
+	// Webhooks delivers notifications after confirmed deploys and upgrades.
+	// Defaults to NewHTTPWebhookSender(nil).
+	Webhooks WebhookSender
 }
 
 // DefaultConfirmTimeout bounds waiting for a transaction to be included.
@@ -109,6 +157,18 @@ type Options struct {
 // This also serves as the backstop for the SDK's PollTransaction, which
 // otherwise polls until its context ends.
 const DefaultConfirmTimeout = 2 * time.Minute
+
+// DefaultVerifyAttempts and DefaultVerifyDelay bound the post-upgrade check
+// that the new bytecode is actually live.
+//
+// A confirmed transaction is included in a ledger, but the RPC node answering
+// the follow-up read may still be serving an entry from before that close.
+// Four reads spread over roughly six seconds covers one ledger close without
+// hanging a CI job on a contract that never upgrades.
+const (
+	DefaultVerifyAttempts = 4
+	DefaultVerifyDelay    = 2 * time.Second
+)
 
 // New builds a Service.
 func New(opts Options) (*Service, error) {
@@ -135,21 +195,150 @@ func New(opts Options) (*Service, error) {
 	if confirmTimeout <= 0 {
 		confirmTimeout = DefaultConfirmTimeout
 	}
+	verifyAttempts := opts.VerifyAttempts
+	if verifyAttempts <= 0 {
+		verifyAttempts = DefaultVerifyAttempts
+	}
+	verifyDelay := opts.VerifyDelay
+	if verifyDelay <= 0 {
+		verifyDelay = DefaultVerifyDelay
+	}
 	registrar := opts.Catalog
 	if registrar == nil {
 		registrar = catalog.NewSoroVault(nil)
 	}
+	maxContractSize := opts.MaxContractSize
+	if maxContractSize <= 0 {
+		maxContractSize = stellar.DefaultMaxContractSize
+	}
+
+	webhooks := opts.Webhooks
+	if webhooks == nil {
+		webhooks = NewHTTPWebhookSender(nil)
+	}
 
 	return &Service{
-		cfg:            opts.Config,
-		store:          opts.Store,
-		signer:         opts.Signer,
-		clients:        clients,
-		log:            log,
-		baseFee:        baseFee,
-		confirmTimeout: confirmTimeout,
-		catalog:        registrar,
+		cfg:             opts.Config,
+		store:           opts.Store,
+		signer:          opts.Signer,
+		clients:         clients,
+		clientCache:     make(map[string]stellar.Client),
+		log:             log,
+		baseFee:         baseFee,
+		confirmTimeout:  confirmTimeout,
+		verifyAttempts:  verifyAttempts,
+		verifyDelay:     verifyDelay,
+		catalog:         registrar,
+		progress:        opts.Progress,
+		webhooks:        webhooks,
+		maxContractSize: maxContractSize,
 	}, nil
+}
+
+// FeeEstimate is the estimated cost of one transaction, in stroops and XLM.
+//
+// It is derived from simulation plus the configured base fee, so it matches
+// what a real submission would declare as its maximum fee. It is an estimate
+// because the network can change fee rates between simulation and submission.
+type FeeEstimate struct {
+	// InclusionFeeStroops is BaseFee × operations, the part that buys ledger
+	// space.
+	InclusionFeeStroops int64 `json:"inclusion_fee_stroops"`
+
+	// ResourceFeeStroops is the Soroban resource fee simulation reported.
+	ResourceFeeStroops int64 `json:"resource_fee_stroops"`
+
+	// TotalStroops is inclusion plus resource.
+	TotalStroops int64 `json:"total_stroops"`
+
+	// TotalXLM is TotalStroops converted to lumens.
+	TotalXLM string `json:"total_xlm"`
+}
+
+// DryRunFees is what a dry run estimates every transaction it assembled will
+// cost, per transaction and in total.
+//
+// Upload is absent when the bytecode was already on-chain, because a real
+// deploy would skip that transaction and its fee.
+type DryRunFees struct {
+	Upload  *FeeEstimate `json:"upload,omitempty"`
+	Create  *FeeEstimate `json:"create,omitempty"`
+	Upgrade *FeeEstimate `json:"upgrade,omitempty"`
+	Init    *FeeEstimate `json:"init,omitempty"`
+
+	Total FeeEstimate `json:"total"`
+}
+
+// sum totals the per-transaction estimates.
+func (f *DryRunFees) sum() FeeEstimate {
+	var total FeeEstimate
+	for _, e := range []*FeeEstimate{f.Upload, f.Create, f.Upgrade, f.Init} {
+		if e == nil {
+			continue
+		}
+		total.InclusionFeeStroops += e.InclusionFeeStroops
+		total.ResourceFeeStroops += e.ResourceFeeStroops
+		total.TotalStroops += e.TotalStroops
+	}
+	total.TotalXLM = stellar.StroopsToXLM(total.TotalStroops)
+	return total
+}
+
+// feeEstimate builds an estimate from an assembled transaction's total fee and
+// the resource fee simulation reported. The two together are exactly the
+// figures Assemble folds into the envelope.
+func feeEstimate(totalFee, resourceFee int64) FeeEstimate {
+	return FeeEstimate{
+		InclusionFeeStroops: totalFee - resourceFee,
+		ResourceFeeStroops:  resourceFee,
+		TotalStroops:        totalFee,
+		TotalXLM:            stellar.StroopsToXLM(totalFee),
+	}
+}
+
+// Progress phases reported while a transaction is in flight. The strings are
+// part of the CLI's output contract but are not serialised anywhere.
+const (
+	ProgressSimulating = "simulating"
+	ProgressSubmitted  = "submitted"
+	ProgressWaiting    = "waiting"
+	ProgressConfirmed  = "confirmed"
+)
+
+// ProgressEvent describes one step of a deploy or upgrade. Step names the
+// host function being run ("upload", "create", or "upgrade") so a caller can
+// tell the two transactions of a deploy apart.
+type ProgressEvent struct {
+	Alias   string `json:"alias"`
+	Network string `json:"network"`
+	Step    string `json:"step"`
+	Phase   string `json:"phase"`
+
+	// Hash is the transaction hash once it is known.
+	Hash string `json:"hash,omitempty"`
+
+	// Ledger is, while waiting, the ledger being awaited, and once confirmed,
+	// the ledger that included the transaction.
+	Ledger uint32 `json:"ledger,omitempty"`
+}
+
+// ProgressFunc receives progress events. It runs on the caller's goroutine and
+// must not block for long.
+type ProgressFunc func(ProgressEvent)
+
+// report sends a progress event when a callback is configured.
+func (s *Service) report(r resolved, step, phase, hash string, ledger uint32) {
+	if s.progress == nil {
+		return
+	}
+	s.progress(ProgressEvent{
+		Alias:   r.Alias,
+		Network: r.NetworkName,
+		Step:    step,
+		Phase:   phase,
+		Hash:    hash,
+		Ledger:  ledger,
+	})
 }
 
 // CatalogStatus reports what happened when a confirmed contract was
@@ -189,13 +378,81 @@ func (s *Service) publish(ctx context.Context, r resolved, contractID string, lo
 	return status
 }
 
+// notifyWebhooks delivers webhook notifications to every endpoint configured on
+// the network. Like publish, it is strictly best-effort: delivery failures are
+// logged and recorded in the returned statuses, but never fail the deploy.
+func (s *Service) notifyWebhooks(ctx context.Context, network config.Network, payload WebhookPayload, log *slog.Logger) []WebhookStatus {
+	if len(network.Webhooks) == 0 {
+		return nil
+	}
+
+	var results []WebhookStatus
+	for _, wh := range network.Webhooks {
+		status := WebhookStatus{URL: wh.URL}
+		if err := s.webhooks.Send(ctx, wh, payload); err != nil {
+			status.OK = false
+			status.Error = err.Error()
+			log.Warn("webhook delivery failed", "url", wh.URL, "error", err)
+		} else {
+			status.OK = true
+			log.Info("webhook delivered", "url", wh.URL)
+		}
+		results = append(results, status)
+	}
+	return results
+}
+
 // Config exposes the loaded configuration, for callers that need to render
 // network or contract names.
 func (s *Service) Config() *config.Config { return s.cfg }
 
+// Close releases clients created for the service. It is safe to call more than
+// once; clients that do not expose Close need no explicit cleanup.
+func (s *Service) Close() error {
+	s.clientMu.Lock()
+	if s.closed {
+		s.clientMu.Unlock()
+		return nil
+	}
+	s.closed = true
+	clients := s.clientCache
+	s.clientCache = nil
+	s.clientMu.Unlock()
+
+	var errs []error
+	for name, client := range clients {
+		if closer, ok := client.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close %s RPC client: %w", name, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Service) clientForNetwork(name string, network config.Network) (stellar.Client, error) {
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+
+	if s.closed {
+		return nil, fmt.Errorf("deploy: service is closed")
+	}
+	if client, ok := s.clientCache[name]; ok {
+		return client, nil
+	}
+
+	client, err := s.clients(name, network)
+	if err != nil {
+		return nil, err
+	}
+	s.clientCache[name] = client
+	return client, nil
+}
+
 // resolve looks up the network and contract a request refers to and connects a
 // client. Every operation starts here, so an unknown alias or network fails the
-// same way regardless of entry point.
+// same way regardless of entry point. Clients are created once per network and
+// shared safely across concurrent operations.
 func (s *Service) resolve(networkName, alias string) (resolved, error) {
 	name, network, err := s.cfg.Network(networkName)
 	if err != nil {
@@ -205,7 +462,10 @@ func (s *Service) resolve(networkName, alias string) (resolved, error) {
 	if err != nil {
 		return resolved{}, err
 	}
-	client, err := s.clients(name, network)
+	// Resolve per-network overrides here, once, so deploy, dry run, and every
+	// other operation see the same effective contract.
+	contract = contract.ForNetwork(name)
+	client, err := s.clientForNetwork(name, network)
 	if err != nil {
 		return resolved{}, fmt.Errorf("connect to %s: %w", name, err)
 	}
@@ -217,6 +477,12 @@ func (s *Service) resolve(networkName, alias string) (resolved, error) {
 		Client:      client,
 	}, nil
 }
+
+const (
+	maxSubmissionAttempts = 5
+	submissionRetryBase   = 100 * time.Millisecond
+	submissionRetryMax    = 2 * time.Second
+)
 
 type resolved struct {
 	NetworkName string
@@ -230,16 +496,17 @@ type resolved struct {
 func (s *Service) requireSigner() (stellar.Signer, error) {
 	if s.signer == nil {
 		return nil, fmt.Errorf(
-			"no signing key configured: set %s or %s (see README security notes)",
-			config.EnvSecretKey, config.EnvKeystorePath)
+			"no signing key configured: set %s or %s, or %s with %s (see README security notes)",
+			config.EnvSecretKey, config.EnvKeystorePath, config.EnvSignerCommand, config.EnvSignerPublicKey)
 	}
 	return s.signer, nil
 }
 
 // txResult describes one submitted transaction.
 type txResult struct {
-	Hash   string
-	Ledger uint32
+	Hash       string
+	Ledger     uint32
+	FeeCharged *int64
 
 	// Simulation is retained so callers can read the host function's return
 	// value — for a create, that is the new contract's address.
@@ -248,6 +515,72 @@ type txResult struct {
 	// EnvelopeXDR is the assembled, signed envelope. On a dry run it is the
 	// assembled but unsigned envelope, and it is the whole point of the run.
 	EnvelopeXDR string
+
+	// Fee is the estimated cost of this transaction, from simulation plus the
+	// configured base fee.
+	Fee FeeEstimate
+}
+
+// stagedError attaches the submission-cycle stage at which a failure happened,
+// and the transaction hash when one was sent, to an error from
+// runTransaction. Deploy and Upgrade read it with errors.As when recording a
+// failed attempt, so the stored row says where the cycle died: before
+// submission (simulate), during the send (submit), or while confirming an
+// included transaction (confirm).
+//
+// The wrapped message is unchanged — Error() returns the underlying text as
+// is — and errors.Is/errors.As pass through Unwrap, so no existing error
+// assertion sees a difference.
+type stagedError struct {
+	stage  store.AttemptStage
+	txHash string
+	err    error
+}
+
+func (e *stagedError) Error() string { return e.err.Error() }
+func (e *stagedError) Unwrap() error { return e.err }
+
+// staged wraps err with the stage it happened at. It passes nil through, so
+// it can sit on every return path of runTransaction without special cases.
+func staged(stage store.AttemptStage, txHash string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &stagedError{stage: stage, txHash: txHash, err: err}
+}
+
+// recordFailure writes one failed deploy or upgrade attempt to the store's
+// deployment_attempts table. Deploy and Upgrade call it from a deferred guard
+// whenever a real (not dry-run) run returns an error, so an included-but-failed
+// transaction or a contract-rejected upgrade leaves a trace instead of only a
+// log line — while the deployments table keeps holding only confirmed history.
+//
+// A recording failure never replaces the operator's original error: the store
+// problem is logged and dropped. The context survives cancellation, because a
+// Ctrl-C or an expired deadline is exactly the kind of failed attempt worth
+// recording.
+func (s *Service) recordFailure(ctx context.Context, r resolved, action store.Action, err error) {
+	if err == nil {
+		return
+	}
+
+	stage, txHash := store.AttemptSimulate, ""
+	var se *stagedError
+	if errors.As(err, &se) {
+		stage, txHash = se.stage, se.txHash
+	}
+
+	if _, recErr := s.store.RecordAttempt(context.WithoutCancel(ctx), store.Attempt{
+		Alias:   r.Alias,
+		Network: r.NetworkName,
+		Action:  action,
+		Stage:   stage,
+		Error:   err.Error(),
+		TxHash:  txHash,
+	}); recErr != nil {
+		s.log.Warn("could not record failed deployment attempt",
+			"alias", r.Alias, "network", r.NetworkName, "error", recErr)
+	}
 }
 
 // runTransaction executes the full Soroban submission cycle for one operation:
@@ -257,20 +590,29 @@ type txResult struct {
 // The simulate-then-assemble step is mandatory rather than an optimisation. A
 // Soroban transaction must declare the exact ledger entries it touches and the
 // resources it consumes, and simulation is the only way to discover them.
+//
+// step labels the operation for progress events ("upload", "create", "upgrade").
 func (s *Service) runTransaction(
 	ctx context.Context,
 	r resolved,
-	op *txnbuild.InvokeHostFunction,
+	op txnbuild.Operation,
+	step string,
 	dryRun bool,
 ) (txResult, error) {
+	// Every failure from here on carries its submission-cycle stage so
+	// recordFailure can say where the attempt died. Pre-submission failures —
+	// account load, simulation, assembly, signing, encodes — are all the
+	// "simulate" stage: nothing ever left this machine.
+	simulate := func(err error) error { return staged(store.AttemptSimulate, "", err) }
+
 	signer, err := s.requireSigner()
 	if err != nil {
-		return txResult{}, err
+		return txResult{}, simulate(err)
 	}
 
 	source, err := r.Client.LoadAccount(ctx, signer.Address())
 	if err != nil {
-		return txResult{}, err
+		return txResult{}, simulate(err)
 	}
 
 	tx, err := stellar.Build(stellar.BuildParams{
@@ -279,62 +621,135 @@ func (s *Service) runTransaction(
 		BaseFee:   s.baseFee,
 	})
 	if err != nil {
-		return txResult{}, err
+		return txResult{}, simulate(err)
 	}
 
 	unsignedXDR, err := tx.Base64()
 	if err != nil {
-		return txResult{}, fmt.Errorf("encode transaction: %w", err)
+		return txResult{}, simulate(fmt.Errorf("encode transaction: %w", err))
 	}
+
+	s.report(r, step, ProgressSimulating, "", 0)
 
 	sim, err := r.Client.Simulate(ctx, unsignedXDR)
 	if err != nil {
-		return txResult{}, err
+		return txResult{}, simulate(err)
 	}
 
 	assembled, err := stellar.Assemble(tx, sim)
 	if err != nil {
-		return txResult{}, err
+		return txResult{}, simulate(err)
 	}
+
+	resourceFee, err := stellar.ResourceFee(sim)
+	if err != nil {
+		return txResult{}, simulate(err)
+	}
+	fee := feeEstimate(assembled.MaxFee(), resourceFee)
 
 	if dryRun {
 		envelope, err := assembled.Base64()
 		if err != nil {
-			return txResult{}, fmt.Errorf("encode assembled transaction: %w", err)
+			return txResult{}, simulate(fmt.Errorf("encode assembled transaction: %w", err))
 		}
 		// Stop before signing. Nothing is sent and nothing is recorded; the
 		// envelope is returned for inspection.
-		return txResult{Simulation: sim, EnvelopeXDR: envelope}, nil
+		return txResult{Simulation: sim, EnvelopeXDR: envelope, Fee: fee}, nil
 	}
 
 	signed, err := signer.Sign(r.Client.NetworkPassphrase(), assembled)
 	if err != nil {
-		return txResult{}, err
+		return txResult{}, simulate(err)
 	}
 	signedXDR, err := signed.Base64()
 	if err != nil {
-		return txResult{}, fmt.Errorf("encode signed transaction: %w", err)
+		return txResult{}, simulate(fmt.Errorf("encode signed transaction: %w", err))
 	}
 
-	sent, err := r.Client.Send(ctx, signedXDR)
-	if err != nil {
-		return txResult{}, err
+	submitCtx, cancel := context.WithTimeout(ctx, s.confirmTimeout)
+	defer cancel()
+
+	var sent stellar.SendResult
+	attempts := 0
+	for attempt := 1; attempt <= maxSubmissionAttempts; attempt++ {
+		attempts = attempt
+		if err := submitCtx.Err(); err != nil {
+			return txResult{}, staged(store.AttemptSubmit, sent.Hash,
+				fmt.Errorf("submission stopped after %d attempt(s): %w", attempt-1, err))
+		}
+		sent, err = r.Client.Send(submitCtx, signedXDR)
+		if err != nil {
+			return txResult{}, staged(store.AttemptSubmit, sent.Hash,
+				fmt.Errorf("send transaction after %d attempt(s): %w", attempt, err))
+		}
+		if sent.Status != stellar.SendStatusTryAgainLater {
+			break
+		}
+		if attempt == maxSubmissionAttempts {
+			return txResult{}, staged(store.AttemptSubmit, sent.Hash, fmt.Errorf(
+				"RPC is busy and did not queue the transaction after %d attempts (transaction %s)",
+				attempt, sent.Hash))
+		}
+
+		s.log.Info("RPC asked to retry transaction submission",
+			"network", r.NetworkName,
+			"attempt", attempt,
+			"max_attempts", maxSubmissionAttempts,
+			"tx_hash", sent.Hash,
+		)
+		if err := waitForRetry(submitCtx, submissionRetryDelay(attempt)); err != nil {
+			return txResult{}, staged(store.AttemptSubmit, sent.Hash,
+				fmt.Errorf("submission stopped after %d attempt(s): %w", attempt, err))
+		}
 	}
 	if err := checkSendStatus(sent); err != nil {
-		return txResult{}, err
+		return txResult{}, staged(store.AttemptSubmit, sent.Hash,
+			fmt.Errorf("submission failed after %d attempt(s): %w", attempts, err))
 	}
+	s.report(r, step, ProgressSubmitted, sent.Hash, 0)
 
-	confirmed, err := s.confirm(ctx, r.Client, sent.Hash)
+	// The latest closed ledger cannot include a transaction just accepted, so
+	// the next one is the earliest it can land in — that is what to wait for.
+	s.report(r, step, ProgressWaiting, sent.Hash, sent.LatestLedger+1)
+
+	confirmed, err := s.confirm(submitCtx, r.Client, sent.Hash)
 	if err != nil {
-		return txResult{}, err
+		return txResult{}, staged(store.AttemptConfirm, sent.Hash,
+			fmt.Errorf("confirmation failed after %d submission attempt(s): %w", attempts, err))
 	}
+	s.report(r, step, ProgressConfirmed, confirmed.Hash, confirmed.Ledger)
 
 	return txResult{
 		Hash:        confirmed.Hash,
 		Ledger:      confirmed.Ledger,
+		FeeCharged:  confirmed.FeeCharged,
 		Simulation:  sim,
 		EnvelopeXDR: signedXDR,
+		Fee:         fee,
 	}, nil
+}
+
+func submissionRetryDelay(attempt int) time.Duration {
+	delay := submissionRetryBase
+	for i := 1; i < attempt && delay < submissionRetryMax; i++ {
+		delay *= 2
+		if delay > submissionRetryMax {
+			delay = submissionRetryMax
+		}
+	}
+	half := delay / 2
+	return half + time.Duration(rand.Int63n(int64(delay)))
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // checkSendStatus turns a non-PENDING submission into a useful error.
@@ -377,4 +792,13 @@ func (s *Service) confirm(ctx context.Context, client stellar.Client, hash strin
 			hash, result.Ledger, result.Status)
 	}
 	return result, nil
+}
+
+// checkRequireNotes validates that actions on networks with require_notes set
+// supply non-empty notes unless the run is a dry run (#154).
+func (s *Service) checkRequireNotes(r resolved, notes string, dryRun bool) error {
+	if r.Network.RequireNotes && !dryRun && strings.TrimSpace(notes) == "" {
+		return fmt.Errorf("network %q requires deploy notes: set require_notes is true in config; provide --notes (or notes in API) to record an audit trail (e.g. --notes \"OPS-1234: routine deploy\")", r.NetworkName)
+	}
+	return nil
 }

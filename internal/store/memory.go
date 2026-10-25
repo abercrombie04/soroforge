@@ -25,6 +25,12 @@ type MemoryStore struct {
 	deployments []Deployment
 	nextID      int64
 
+	// Failed attempts live in their own list with their own id counter,
+	// mirroring the separate deployment_attempts table its own sequence —
+	// ids mean different things in the two tables and must not interfere.
+	attempts     []Attempt
+	attemptsNext int64
+
 	// now is overridable so tests can produce deterministic timestamps.
 	now func() time.Time
 }
@@ -34,9 +40,10 @@ var _ Store = (*MemoryStore)(nil)
 // NewMemoryStore returns an empty in-memory store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		contracts: make(map[string]Contract),
-		nextID:    1,
-		now:       time.Now,
+		contracts:    make(map[string]Contract),
+		nextID:       1,
+		attemptsNext: 1,
+		now:          time.Now,
 	}
 }
 
@@ -72,6 +79,7 @@ func (m *MemoryStore) UpsertContract(ctx context.Context, c Contract) (Contract,
 		existing.ContractID = c.ContractID
 		existing.CurrentWasmHash = c.CurrentWasmHash
 		existing.UpdatedAt = now
+		// Preserve existing UntrackedAt — untracking is a separate operation.
 		m.contracts[key] = existing
 		return existing, nil
 	}
@@ -112,7 +120,9 @@ func (m *MemoryStore) ListContracts(ctx context.Context, network string) ([]Cont
 	out := []Contract{}
 	for _, c := range m.contracts {
 		if network == "" || c.Network == network {
-			out = append(out, c)
+			if c.UntrackedAt == nil {
+				out = append(out, c)
+			}
 		}
 	}
 	// Matches the Postgres ORDER BY, so callers see the same ordering from
@@ -124,6 +134,25 @@ func (m *MemoryStore) ListContracts(ctx context.Context, network string) ([]Cont
 		return out[i].Alias < out[j].Alias
 	})
 	return out, nil
+}
+
+// ListContractsPage implements Store.
+func (m *MemoryStore) ListContractsPage(ctx context.Context, network string, limit, offset int) ([]Contract, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	contracts, err := m.ListContracts(ctx, network)
+	if err != nil {
+		return nil, err
+	}
+	if offset >= len(contracts) {
+		return []Contract{}, nil
+	}
+	end := len(contracts)
+	if limit < len(contracts)-offset {
+		end = offset + limit
+	}
+	return contracts[offset:end], nil
 }
 
 // RecordDeployment implements Store.
@@ -141,6 +170,15 @@ func (m *MemoryStore) RecordDeployment(ctx context.Context, d Deployment) (Deplo
 	d.ID = m.nextID
 	m.nextID++
 	d.CreatedAt = m.now()
+
+	if d.FeeCharged != nil {
+		fee := *d.FeeCharged
+		d.FeeCharged = &fee
+	}
+	if d.Actor == "" {
+		d.Actor = "cli"
+	}
+
 	m.deployments = append(m.deployments, d)
 	return d, nil
 }
@@ -171,5 +209,241 @@ func (m *MemoryStore) History(ctx context.Context, network, alias string) ([]Dep
 	return out, nil
 }
 
+// ListAllDeployments implements Store. Returned in id order, matching the
+// Postgres and SQLite ORDER BY, so exports are byte-identical across backends.
+func (m *MemoryStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]Deployment, len(m.deployments))
+	copy(out, m.deployments)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// importSnapshot implements snapshotImporter: inserts records verbatim,
+// preserving the ids and timestamps an import carries rather than re-stamping
+// them, and advances the id counter past everything imported so subsequent
+// RecordDeployment calls cannot collide.
+func (m *MemoryStore) importSnapshot(ctx context.Context, contracts []Contract, deployments []Deployment) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	next := m.nextID
+	for _, c := range contracts {
+		m.contracts[contractKey(c.Network, c.Alias)] = c
+		if c.ID >= next {
+			next = c.ID + 1
+		}
+	}
+	for _, d := range deployments {
+		if d.Actor == "" {
+			d.Actor = "cli"
+		}
+		m.deployments = append(m.deployments, d)
+		if d.ID >= next {
+			next = d.ID + 1
+		}
+	}
+	m.nextID = next
+	return nil
+}
+
+// HistoryPage implements Store.
+func (m *MemoryStore) HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]Deployment, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	history, err := m.History(ctx, network, alias)
+	if err != nil {
+		return nil, err
+	}
+	if offset >= len(history) {
+		return []Deployment{}, nil
+	}
+	end := len(history)
+	if limit < len(history)-offset {
+		end = offset + limit
+	}
+	return history[offset:end], nil
+}
+
+// RecordAttempt implements Store. Like the SQL backends, the stored error is
+// redacted of any secret-shaped material before it is kept.
+func (m *MemoryStore) RecordAttempt(ctx context.Context, a Attempt) (Attempt, error) {
+	if err := ctx.Err(); err != nil {
+		return Attempt{}, err
+	}
+	if err := a.Validate(); err != nil {
+		return Attempt{}, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	a.ID = m.attemptsNext
+	m.attemptsNext++
+	a.CreatedAt = m.now()
+	a.Error = SanitizeKeyMaterial(a.Error)
+
+	m.attempts = append(m.attempts, a)
+	return a, nil
+}
+
+// Attempts implements Store. Newest first, same ordering guarantee as History.
+func (m *MemoryStore) Attempts(ctx context.Context, network, alias string) ([]Attempt, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := []Attempt{}
+	for _, a := range m.attempts {
+		if a.Network == network && a.Alias == alias {
+			out = append(out, a)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
+	return out, nil
+}
+
+// CountAttemptsBefore implements Store.
+func (m *MemoryStore) CountAttemptsBefore(ctx context.Context, before time.Time) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	n := 0
+	for _, attempt := range m.attempts {
+		if attempt.CreatedAt.Before(before) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// PruneAttempts implements Store.
+func (m *MemoryStore) PruneAttempts(ctx context.Context, before time.Time) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	kept := m.attempts[:0]
+	removed := 0
+	for _, attempt := range m.attempts {
+		if attempt.CreatedAt.Before(before) {
+			removed++
+			continue
+		}
+		kept = append(kept, attempt)
+	}
+	m.attempts = kept
+	return removed, nil
+}
+
 // Close implements Store. There is nothing to release.
 func (m *MemoryStore) Close() error { return nil }
+
+// RenameContract renames a tracked contract's alias and all its history atomically.
+func (m *MemoryStore) RenameContract(ctx context.Context, network, oldAlias, newAlias string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if new alias already exists.
+	key := contractKey(network, newAlias)
+	if _, ok := m.contracts[key]; ok {
+		return fmt.Errorf("rename contract: alias %q already exists on %s", newAlias, network)
+	}
+
+	// Get the old contract.
+	oldKey := contractKey(network, oldAlias)
+	contract, ok := m.contracts[oldKey]
+	if !ok {
+		return fmt.Errorf("rename contract: %w", ErrNotFound)
+	}
+
+	// Update contract alias.
+	delete(m.contracts, oldKey)
+	contract.Alias = newAlias
+	contract.UpdatedAt = m.now()
+	m.contracts[key] = contract
+
+	// Update deployments.
+	for i := range m.deployments {
+		if m.deployments[i].Network == network && m.deployments[i].Alias == oldAlias {
+			m.deployments[i].Alias = newAlias
+		}
+	}
+
+	// Update attempts.
+	for i := range m.attempts {
+		if m.attempts[i].Network == network && m.attempts[i].Alias == oldAlias {
+			m.attempts[i].Alias = newAlias
+		}
+	}
+
+	return nil
+}
+
+// UntrackContract stops tracking a contract while keeping its history readable.
+func (m *MemoryStore) UntrackContract(ctx context.Context, network, alias string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := contractKey(network, alias)
+	contract, ok := m.contracts[key]
+	if !ok {
+		return fmt.Errorf("untrack contract: %w", ErrNotFound)
+	}
+
+	now := m.now()
+	contract.UntrackedAt = &now
+	contract.UpdatedAt = now
+	m.contracts[key] = contract
+
+	return nil
+}
+
+// GetDeployment implements Store.
+func (m *MemoryStore) GetDeployment(ctx context.Context, id int64) (Deployment, error) {
+	if err := ctx.Err(); err != nil {
+		return Deployment{}, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, d := range m.deployments {
+		if d.ID == id {
+			return d, nil
+		}
+	}
+	return Deployment{}, fmt.Errorf("deployment %d: %w", id, ErrNotFound)
+}

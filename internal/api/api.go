@@ -14,6 +14,7 @@ package api
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,10 +40,12 @@ import (
 type Service interface {
 	Deploy(ctx context.Context, req deploy.DeployRequest) (*deploy.DeployResult, error)
 	Upgrade(ctx context.Context, req deploy.UpgradeRequest) (*deploy.UpgradeResult, error)
+	Track(ctx context.Context, req deploy.TrackRequest) (*deploy.TrackResult, error)
 	Status(ctx context.Context, req deploy.StatusRequest) (*deploy.StatusResult, error)
 	StatusAll(ctx context.Context, network string) (*deploy.NetworkStatus, error)
-	List(ctx context.Context, network string) ([]store.Contract, error)
-	History(ctx context.Context, network, alias string) ([]store.Deployment, error)
+	ListPage(ctx context.Context, network string, limit, offset int) ([]store.Contract, error)
+	HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]store.Deployment, error)
+	GetDeployment(ctx context.Context, id int64) (store.Deployment, error)
 }
 
 // Readiness reports whether SoroForge's dependencies are usable. It backs
@@ -55,12 +58,24 @@ type Readiness interface {
 	Check(ctx context.Context) readiness.Status
 }
 
+//go:embed openapi.json
+var openAPIDocument []byte
+
 // requestTimeout bounds a single API request.
 //
 // A deploy waits for two transactions to be confirmed, so this has to be
 // generous — but it must exist, or a stuck network holds a connection open
 // indefinitely.
 const requestTimeout = 5 * time.Minute
+
+// maxRequestBodyBytes caps the request body of the mutating endpoints.
+//
+// Deploy and upgrade bodies are a handful of small fields — an alias, a
+// network, a wasm path or hash, free-text notes — so 64 KiB leaves orders of
+// magnitude of headroom. Without a cap, an authenticated but misbehaving
+// client could make the server buffer an arbitrarily large body; with one,
+// the decoder is stopped at the limit instead.
+const maxRequestBodyBytes = 64 << 10 // 64 KiB
 
 // preflightMaxAge bounds how long a browser may cache a preflight answer.
 //
@@ -74,12 +89,17 @@ type Options struct {
 	// Service performs the work. Required.
 	Service Service
 
-	// Tokens are the bearer credentials the API accepts. At least one is
-	// required; the server refuses to start without one.
+	// Tokens are the scoped bearer credentials the API accepts. At least one
+	// is required; the server refuses to start without one.
 	Tokens []Token
 
 	// Readiness checks dependencies for GET /ready. Required.
 	Readiness Readiness
+
+	// RateLimit bounds how often one client may call /v1. The zero value
+	// disables limiting; soroforge serve sets it from configuration, where
+	// the documented defaults live.
+	RateLimit RateLimitOptions
 
 	// CORSOrigins, when non-empty, allows exactly these browser origins to
 	// call the API cross-origin; empty (the default) sends no CORS headers at
@@ -93,6 +113,10 @@ type Options struct {
 
 	// Log defaults to slog.Default().
 	Log *slog.Logger
+
+	// JobRetention is how long finished async jobs stay fetchable. Defaults to
+	// DefaultJobRetention; tests shorten it.
+	JobRetention time.Duration
 }
 
 // route is one endpoint, the scope a token must hold to call it, and its
@@ -119,14 +143,20 @@ func (h *handlers) routes() []route {
 	return []route{
 		{http.MethodGet, "/health", ScopePublic, h.health},
 		{http.MethodGet, "/ready", ScopePublic, h.ready},
+		{http.MethodGet, "/openapi.json", ScopePublic, h.openapi},
 
 		{http.MethodPost, "/v1/deploy", ScopeWrite, h.deploy},
 		{http.MethodPost, "/v1/upgrade", ScopeWrite, h.upgrade},
+		{http.MethodPost, "/v1/track", ScopeWrite, h.track},
+
+		{http.MethodGet, "/v1/jobs/{id}", ScopeRead, h.job},
 
 		{http.MethodGet, "/v1/contracts", ScopeRead, h.listContracts},
 		{http.MethodGet, "/v1/contracts/{network}/{alias}/history", ScopeRead, h.history},
 		{http.MethodGet, "/v1/contracts/{network}/{alias}/status", ScopeRead, h.status},
 		{http.MethodGet, "/v1/contracts/{network}/status", ScopeRead, h.statusAll},
+
+		{http.MethodGet, "/v1/deployments/{id}", ScopeRead, h.getDeployment},
 	}
 }
 
@@ -161,8 +191,14 @@ func NewRouter(opts Options) (http.Handler, error) {
 		log = slog.Default()
 	}
 
-	h := &handlers{svc: opts.Service, readiness: opts.Readiness, log: log}
+	h := &handlers{
+		svc:       opts.Service,
+		readiness: opts.Readiness,
+		log:       log,
+		jobs:      newJobManager(opts.JobRetention, log),
+	}
 	auth := &authenticator{tokens: opts.Tokens}
+	rateLimit := RateLimit(opts.RateLimit)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -173,6 +209,11 @@ func NewRouter(opts Options) (http.Handler, error) {
 	r.Use(middleware.Timeout(requestTimeout))
 
 	for _, rt := range h.routes() {
+		if strings.HasPrefix(rt.pattern, "/v1/") {
+			r.With(rateLimit, auth.authorize(rt.scope, rt.pattern)).
+				Method(rt.method, rt.pattern, rt.handler)
+			continue
+		}
 		r.With(auth.authorize(rt.scope, rt.pattern)).Method(rt.method, rt.pattern, rt.handler)
 	}
 
@@ -279,6 +320,7 @@ type handlers struct {
 	svc       Service
 	readiness Readiness
 	log       *slog.Logger
+	jobs      *jobManager
 }
 
 // errorResponse is the body returned for every failure, so clients can parse
@@ -302,6 +344,16 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Error: message})
 }
 
+// decodeBody caps the request body and decodes it as JSON.
+//
+// The cap is applied before json.NewDecoder reads anything, so an oversized
+// body is refused rather than buffered, and the *http.MaxBytesError it
+// produces lets writeDecodeError answer 413 instead of a generic 400.
+func decodeBody(w http.ResponseWriter, r *http.Request, dest any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	return decodeJSON(r, dest)
+}
+
 // decodeJSON reads a request body, rejecting unknown fields so that a
 // misspelled key is a clear 400 rather than a silently ignored option — the
 // same reasoning as KnownFields in the config loader.
@@ -312,6 +364,21 @@ func decodeJSON(r *http.Request, dest any) error {
 		return fmt.Errorf("invalid request body: %w", err)
 	}
 	return nil
+}
+
+// writeDecodeError writes the response for a body that could not be decoded.
+//
+// A body over the cap is a 413: the request is well-formed, just too large to
+// accept, and that is the code clients and proxies already understand for it.
+// Everything else is the 400 used for malformed JSON or an unknown field.
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("request body exceeds the %d byte limit", maxRequestBodyBytes))
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
 }
 
 // statusForError maps an operation error to an HTTP status.

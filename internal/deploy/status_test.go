@@ -2,8 +2,10 @@ package deploy_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
+	"github.com/soroworks/soroforge/internal/config"
 	"github.com/soroworks/soroforge/internal/deploy"
 	"github.com/soroworks/soroforge/internal/stellar"
 	"github.com/soroworks/soroforge/internal/store"
@@ -89,6 +91,29 @@ func TestStatusMissingOnChain(t *testing.T) {
 	assert.Contains(t, result.Detail, "no instance")
 }
 
+func TestStatusArchived(t *testing.T) {
+	// An archived contract still exists, so it is neither missing nor in
+	// sync: it needs a restore before it can be called again, and the status
+	// must say so rather than reporting drift or absence.
+	h := newHarness(t, harnessOptions{})
+	ctx := context.Background()
+
+	_, err := h.store.UpsertContract(ctx, store.Contract{
+		Alias: "counter", Network: "testnet", ContractID: h.contractID,
+		CurrentWasmHash: stellar.HashHex(h.wasmHash),
+	})
+	require.NoError(t, err)
+	require.NoError(t, h.client.SetContractInstanceArchived(h.contractID, h.wasmHash))
+
+	result, err := h.svc.Status(ctx, deploy.StatusRequest{Alias: "counter"})
+	require.NoError(t, err)
+
+	assert.Equal(t, deploy.StateArchived, result.State)
+	assert.False(t, result.InSync())
+	assert.Contains(t, result.Detail, "archived")
+	assert.Contains(t, result.Detail, "soroforge restore counter")
+}
+
 func TestStatusIsPerNetwork(t *testing.T) {
 	// A contract in sync on testnet says nothing about mainnet.
 	h := newHarness(t, harnessOptions{})
@@ -161,15 +186,15 @@ func TestHistoryReturnsFullTimeline(t *testing.T) {
 	for _, d := range []store.Deployment{
 		{
 			Alias: "counter", Network: "testnet", ContractID: h.contractID, WasmHash: "v1",
-			Action: store.ActionDeploy, DeployerPubkey: "GABC",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
 		},
 		{
 			Alias: "counter", Network: "testnet", ContractID: h.contractID, WasmHash: "v2",
-			Action: store.ActionUpgrade, DeployerPubkey: "GABC",
+			Action: store.ActionUpgrade, DeployerPubkey: "GABC", Actor: "cli",
 		},
 		{
 			Alias: "counter", Network: "testnet", ContractID: h.contractID, WasmHash: "v3",
-			Action: store.ActionUpgrade, DeployerPubkey: "GDEF",
+			Action: store.ActionUpgrade, DeployerPubkey: "GDEF", Actor: "cli",
 		},
 	} {
 		_, err := h.store.RecordDeployment(ctx, d)
@@ -191,7 +216,7 @@ func TestHistoryDefaultsToConfiguredNetwork(t *testing.T) {
 
 	_, err := h.store.RecordDeployment(ctx, store.Deployment{
 		Alias: "counter", Network: "testnet", ContractID: h.contractID, WasmHash: "v1",
-		Action: store.ActionDeploy, DeployerPubkey: "GABC",
+		Action: store.ActionDeploy, DeployerPubkey: "GABC", Actor: "cli",
 	})
 	require.NoError(t, err)
 
@@ -206,6 +231,58 @@ func TestNewServiceValidatesRequiredDependencies(t *testing.T) {
 
 	_, err = deploy.New(deploy.Options{Config: newHarness(t, harnessOptions{}).svc.Config()})
 	assert.ErrorContains(t, err, "store is required")
+}
+
+func TestServiceCachesClientsPerNetworkConcurrentlyAndClosesThem(t *testing.T) {
+	h := newHarness(t, harnessOptions{noSigner: true})
+	var mu sync.Mutex
+	counts := map[string]int{}
+	clients := map[string]*stellar.MockClient{}
+
+	svc, err := deploy.New(deploy.Options{
+		Config: h.cfg,
+		Store:  h.store,
+		Clients: func(name string, _ config.Network) (stellar.Client, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			counts[name]++
+			client := stellar.NewMockClient()
+			clients[name] = client
+			return client, nil
+		},
+	})
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 40)
+	for _, network := range []string{"testnet", "mainnet"} {
+		for range 20 {
+			wg.Add(1)
+			go func(network string) {
+				defer wg.Done()
+				_, err := svc.Status(context.Background(), deploy.StatusRequest{
+					Alias: "counter", Network: network,
+				})
+				if err != nil {
+					errs <- err
+				}
+			}(network)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, map[string]int{"testnet": 1, "mainnet": 1}, counts)
+	require.NoError(t, svc.Close())
+	require.NoError(t, svc.Close(), "closing is idempotent")
+	assert.Equal(t, 1, clients["testnet"].CloseCalls)
+	assert.Equal(t, 1, clients["mainnet"].CloseCalls)
+
+	_, err = svc.Status(context.Background(), deploy.StatusRequest{Alias: "counter"})
+	assert.ErrorContains(t, err, "service is closed")
 }
 
 func TestStatusAllChecksEveryTrackedContract(t *testing.T) {
@@ -280,4 +357,71 @@ func TestStatusAllRejectsUnknownNetwork(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	_, err := h.svc.StatusAll(context.Background(), "nowhere")
 	assert.Error(t, err)
+}
+
+func TestStatusSACInSync(t *testing.T) {
+	h := newHarness(t, harnessOptions{configBody: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  xlm:
+    asset: native
+`})
+	ctx := context.Background()
+
+	sacID := otherContractID(t, 10)
+	_, err := h.store.UpsertContract(ctx, store.Contract{
+		Alias:           "xlm",
+		Network:         "testnet",
+		ContractID:      sacID,
+		CurrentWasmHash: "stellar_asset",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, h.client.SetSACInstance(sacID))
+
+	status, err := h.svc.Status(ctx, deploy.StatusRequest{Alias: "xlm"})
+	require.NoError(t, err)
+
+	assert.Equal(t, deploy.StateInSync, status.State)
+	assert.Equal(t, "stellar_asset", status.ExpectedWasmHash)
+	assert.Equal(t, "stellar_asset", status.ActualWasmHash)
+	assert.True(t, status.InSync())
+}
+
+func TestStatusSACDrift(t *testing.T) {
+	h := newHarness(t, harnessOptions{configBody: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+contracts:
+  xlm:
+    asset: native
+`})
+	ctx := context.Background()
+
+	sacID := otherContractID(t, 10)
+	_, err := h.store.UpsertContract(ctx, store.Contract{
+		Alias:           "xlm",
+		Network:         "testnet",
+		ContractID:      sacID,
+		CurrentWasmHash: "some_old_wasm_hash",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, h.client.SetSACInstance(sacID))
+
+	status, err := h.svc.Status(ctx, deploy.StatusRequest{Alias: "xlm"})
+	require.NoError(t, err)
+
+	assert.Equal(t, deploy.StateDrift, status.State)
+	assert.Equal(t, "stellar_asset", status.ActualWasmHash)
+	assert.False(t, status.InSync())
 }
